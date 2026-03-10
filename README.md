@@ -3,7 +3,7 @@
 <h3 align="center">Hierarchical Autoregressive Video Generation with Pipelined Parallel Inference</h3>
 </p>
 <p align="center">
-  <h3 align="center"><a href="https://arxiv.org/abs/PLACEHOLDER">arXiv</a> | <a href="https://jacky-hate.github.io/HiAR/">Website</a> | <a href="https://huggingface.co/jackyhate/HiAR/tree/main">Model</a></h3>
+  <h3 align="center"><a href="https://arxiv.org/abs/2603.08703">arXiv</a> | <a href="https://jacky-hate.github.io/HiAR/">Website</a> | <a href="https://huggingface.co/jackyhate/HiAR/tree/main">Model</a></h3>
 </p>
 
 ---
@@ -136,10 +136,13 @@ This codebase is built on [Self-Forcing](https://github.com/self-forcing/Self-Fo
 
 ## Citation
 ```bibtex
-@article{zou2026hiar,
-  title={HiAR: Efficient Autoregressive Long Video Generation via Hierarchical Denoising},
-  author={Zou, Kai and Zheng, Dian and Liu, Hongbo and Hang, Tiankai and Liu, Bin and Yu, Nenghai},
-  journal={Under review},
-  year={2026}
+@misc{zou2026hiarefficientautoregressivelong,
+      title={HiAR: Efficient Autoregressive Long Video Generation via Hierarchical Denoising}, 
+      author={Kai Zou and Dian Zheng and Hongbo Liu and Tiankai Hang and Bin Liu and Nenghai Yu},
+      year={2026},
+      eprint={2603.08703},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2603.08703}, 
 }
 ```

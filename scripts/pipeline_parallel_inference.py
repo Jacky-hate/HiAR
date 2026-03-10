@@ -42,6 +42,33 @@ from pipeline import CausalInferencePipeline
 from utils.misc import set_seed
 
 
+def _clean_state_dict_keys(state_dict):
+    return {
+        k.replace("_fsdp_wrapped_module.", "")
+         .replace("_checkpoint_wrapped_module.", "")
+         .replace("_orig_mod.", ""): v
+        for k, v in state_dict.items()
+    }
+
+
+def _extract_generator_state_dict(checkpoint):
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)}")
+
+    for key in ("generator_ema", "generator", "model"):
+        if key in checkpoint and isinstance(checkpoint[key], dict):
+            return checkpoint[key]
+
+    if all(isinstance(k, str) for k in checkpoint.keys()):
+        return checkpoint
+
+    available_keys = ", ".join(map(str, checkpoint.keys()))
+    raise KeyError(
+        "Unable to locate generator weights in checkpoint. "
+        f"Available top-level keys: {available_keys}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -59,6 +86,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--noise_seed", type=int, default=123,
                     help="Shared seed for SDE noise consistency across GPUs")
+    p.add_argument("--vae_decode_chunk_size", type=int, default=8,
+                    help="Number of latent frames to decode per VAE chunk when saving video")
     p.add_argument("--no_dac", action="store_true",
                     help="Disable DAC optimisation; use barrier+broadcast")
     p.add_argument("--profile", action="store_true",
@@ -69,6 +98,38 @@ def parse_args():
     p.add_argument("--dac_optimize", action="store_true",
                     help=argparse.SUPPRESS)
     return p.parse_args()
+
+
+def _get_latent_shape(config):
+    image_or_video_shape = getattr(config, "image_or_video_shape", None)
+    if image_or_video_shape is None or len(image_or_video_shape) != 5:
+        raise ValueError(
+            "Config must provide image_or_video_shape=[B, F, C, H, W] for pipeline inference"
+        )
+    return tuple(int(v) for v in image_or_video_shape[2:])
+
+
+def _align_num_output_frames(requested_num_output_frames, pipeline):
+    nfpb = pipeline.num_frame_per_block
+    if pipeline.independent_first_frame:
+        remainder = (requested_num_output_frames - 1) % nfpb
+    else:
+        remainder = requested_num_output_frames % nfpb
+    if remainder == 0:
+        return requested_num_output_frames
+
+    aligned_num_output_frames = requested_num_output_frames + (nfpb - remainder)
+    print(
+        f"num_output_frames ({requested_num_output_frames}) is not divisible by "
+        f"num_frame_per_block ({nfpb}); rounding up to {aligned_num_output_frames}"
+    )
+    return aligned_num_output_frames
+
+
+def _prepare_runtime_spec(pipeline, config):
+    pipeline.latent_shape = _get_latent_shape(config)
+    _, height, width = pipeline.latent_shape
+    pipeline._update_runtime_cache_spec(height, width)
 
 
 # ---------------------------------------------------------------------------
@@ -88,19 +149,12 @@ def _load_pipeline(args, config, device):
 
     for r in range(world_size):
         if r == rank:
-            state_dict = torch.load(
+            checkpoint = torch.load(
                 args.checkpoint_path, map_location="cpu", mmap=True)
-            load_key = ("generator_ema"
-                        if "generator_ema" in state_dict else "generator")
-            raw_sd = state_dict[load_key]
-            clean_sd = {
-                k.replace("_fsdp_wrapped_module.", "")
-                 .replace("_checkpoint_wrapped_module.", "")
-                 .replace("_orig_mod.", ""): v
-                for k, v in raw_sd.items()
-            }
+            raw_sd = _extract_generator_state_dict(checkpoint)
+            clean_sd = _clean_state_dict_keys(raw_sd)
             pipeline.generator.load_state_dict(clean_sd)
-            del state_dict, raw_sd, clean_sd
+            del checkpoint, raw_sd, clean_sd
             gc.collect()
         if dist.is_initialized():
             dist.barrier()
@@ -117,18 +171,25 @@ def _load_pipeline(args, config, device):
 # ---------------------------------------------------------------------------
 def _setup_local_attention(pipeline, num_output_frames):
     if num_output_frames > 21:
+        if pipeline.frame_seq_length is None:
+            raise ValueError("frame_seq_length must be initialized before enabling local attention")
         la = 21
         pipeline.local_attn_size = la
         pipeline.generator.model.local_attn_size = la
         for blk in pipeline.generator.model.blocks:
             blk.self_attn.local_attn_size = la
-            blk.self_attn.max_attention_size = la * 1560
+            blk.self_attn.max_attention_size = la * pipeline.frame_seq_length
+
+
 
 
 # ---------------------------------------------------------------------------
 # KV / cross-attention cache initialisation
 # ---------------------------------------------------------------------------
 def _init_caches(pipeline, batch_size, device):
+    if pipeline.frame_seq_length is None:
+        raise ValueError("frame_seq_length must be initialized before cache allocation")
+
     if pipeline.local_attn_size != -1:
         kv_sz = pipeline.local_attn_size * pipeline.frame_seq_length
     else:
@@ -138,10 +199,10 @@ def _init_caches(pipeline, batch_size, device):
     for _ in range(pipeline.num_transformer_blocks):
         kv_cache.append({
             "k": torch.zeros(
-                [batch_size, kv_sz, 12, 128],
+                [batch_size, kv_sz, pipeline.num_attention_heads, pipeline.attention_head_dim],
                 dtype=torch.bfloat16, device=device),
             "v": torch.zeros(
-                [batch_size, kv_sz, 12, 128],
+                [batch_size, kv_sz, pipeline.num_attention_heads, pipeline.attention_head_dim],
                 dtype=torch.bfloat16, device=device),
             "global_end_index": torch.tensor([0], dtype=torch.long,
                                               device=device),
@@ -150,10 +211,10 @@ def _init_caches(pipeline, batch_size, device):
         })
         crossattn_cache.append({
             "k": torch.zeros(
-                [batch_size, 512, 12, 128],
+                [batch_size, pipeline.text_context_len, pipeline.num_attention_heads, pipeline.attention_head_dim],
                 dtype=torch.bfloat16, device=device),
             "v": torch.zeros(
-                [batch_size, 512, 12, 128],
+                [batch_size, pipeline.text_context_len, pipeline.num_attention_heads, pipeline.attention_head_dim],
                 dtype=torch.bfloat16, device=device),
             "is_init": False,
         })
@@ -167,7 +228,7 @@ def _run_baseline(pipeline, args, prompt, device, rank, my_stage, num_stages,
                   num_blocks, num_frames, noise_bank, profile):
     batch_size = 1
     nfpb = pipeline.num_frame_per_block
-    num_channels, height, width = 16, 60, 104
+    num_channels, height, width = pipeline.latent_shape
 
     noise = torch.randn(
         [batch_size, num_frames, num_channels, height, width],
@@ -258,7 +319,7 @@ def _run_dac(pipeline, args, prompt, device, rank, my_stage, num_stages,
              num_blocks, num_frames, noise_bank, profile):
     batch_size = 1
     nfpb = pipeline.num_frame_per_block
-    num_channels, height, width = 16, 60, 104
+    num_channels, height, width = pipeline.latent_shape
 
     noise = torch.randn(
         [batch_size, num_frames, num_channels, height, width],
@@ -376,6 +437,40 @@ def _resolve_profile(entries, rank, my_stage, mode):
     return result
 
 
+def _save_output_video_streaming(pipeline, latent, opath, chunk_num_frames, fps=16):
+    if chunk_num_frames <= 0:
+        raise ValueError(f"vae_decode_chunk_size must be positive, got {chunk_num_frames}")
+
+    total_latent_frames = latent.shape[1]
+    total_chunks = (total_latent_frames + chunk_num_frames - 1) // chunk_num_frames
+    saved_frames = 0
+
+    os.makedirs(os.path.dirname(opath) or ".", exist_ok=True)
+    writer = imageio.get_writer(opath, fps=fps, quality=8)
+    try:
+        for chunk_idx, pixel_chunk in enumerate(
+            pipeline.vae.iter_decode_to_pixel_chunks(
+                latent, chunk_num_frames=chunk_num_frames
+            ),
+            start=1,
+        ):
+            pixel_chunk = (pixel_chunk * 0.5 + 0.5).clamp_(0, 1)
+            frame_chunk = rearrange(pixel_chunk[0], "t c h w -> t h w c")
+            frame_chunk = (255.0 * frame_chunk).clamp_(0, 255).to(torch.uint8).cpu().numpy()
+            for frame in frame_chunk:
+                writer.append_data(frame)
+            saved_frames += frame_chunk.shape[0]
+            if chunk_idx == 1 or chunk_idx == total_chunks or chunk_idx % 20 == 0:
+                print(
+                    f"VAE decode/save chunk {chunk_idx}/{total_chunks}, "
+                    f"written {saved_frames} pixel frames"
+                )
+            del pixel_chunk, frame_chunk
+    finally:
+        writer.close()
+        pipeline.vae.model.clear_cache()
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -383,118 +478,152 @@ def main():
     args = parse_args()
 
     dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-    torch.set_grad_enabled(False)
-    set_seed(args.seed)
+    try:
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+        torch.set_grad_enabled(False)
+        set_seed(args.seed)
 
-    config = OmegaConf.load(args.config_path)
-    default_config = OmegaConf.load("configs/default_config.yaml")
-    config = OmegaConf.merge(default_config, config)
+        config = OmegaConf.load(args.config_path)
+        default_config = OmegaConf.load("configs/default_config.yaml")
+        config = OmegaConf.merge(default_config, config)
 
-    num_stages = len(config.denoising_step_list)
-    assert world_size == num_stages, (
-        f"GPUs ({world_size}) must equal denoising steps ({num_stages})")
-    my_stage = rank
+        num_stages = len(config.denoising_step_list)
+        assert world_size == num_stages, (
+            f"GPUs ({world_size}) must equal denoising steps ({num_stages})")
+        my_stage = rank
 
-    # DAC is default; --no_dac disables it
-    use_dac = not args.no_dac or args.dac_optimize
-
-    if rank == 0:
-        tag = "baseline" if not use_dac else "DAC"
-        print(f"Pipeline parallel [{tag}]: "
-              f"{num_stages} stages on {world_size} GPUs")
-
-    pipeline = _load_pipeline(args, config, device)
-    _setup_local_attention(pipeline, args.num_output_frames)
-
-    if args.prompt:
-        prompts = [args.prompt]
-    elif args.data_path:
-        with open(args.data_path) as f:
-            prompts = [l.strip() for l in f if l.strip()]
-    else:
-        raise ValueError("--prompt or --data_path required")
-
-    dist.barrier()
-
-    for pidx, prompt in enumerate(prompts):
-        if rank == 0:
-            print(f"\n[{pidx + 1}/{len(prompts)}] {prompt[:80]}...")
-
-        num_frames = args.num_output_frames
-        nfpb = pipeline.num_frame_per_block
-        num_blocks = num_frames // nfpb
-
-        noise_bank = {}
-        gen = torch.Generator(device=device).manual_seed(args.noise_seed)
-        bshape = [1, nfpb, 16, 60, 104]
-        for s in range(num_stages):
-            for b in range(num_blocks):
-                noise_bank[(s, b)] = torch.randn(
-                    bshape, device=device, dtype=torch.bfloat16,
-                    generator=gen)
-
-        run_fn = _run_dac if use_dac else _run_baseline
-        output, elapsed, prof_entries = run_fn(
-            pipeline, args, prompt, device, rank, my_stage, num_stages,
-            num_blocks, num_frames, noise_bank, args.profile)
+        # DAC is default; --no_dac disables it
+        use_dac = not args.no_dac or args.dac_optimize
 
         if rank == 0:
-            print(f"Inference time: {elapsed:.2f}s "
-                  f"({num_blocks} blocks, {num_stages} stages)")
+            tag = "baseline" if not use_dac else "DAC"
+            print(f"Pipeline parallel [{tag}]: "
+                  f"{num_stages} stages on {world_size} GPUs")
 
-        # Profiling summary
-        if args.profile and prof_entries:
-            mode = "dac" if use_dac else "baseline"
-            prof = _resolve_profile(prof_entries, rank, my_stage, mode)
-            prof["num_stages"] = num_stages
-            prof["num_blocks"] = num_blocks
-            prof["num_frames"] = num_frames
-            prof["total_time_s"] = elapsed
+        pipeline = _load_pipeline(args, config, device)
+        args.num_output_frames = _align_num_output_frames(args.num_output_frames, pipeline)
+        _prepare_runtime_spec(pipeline, config)
+        _setup_local_attention(pipeline, args.num_output_frames)
 
-            if args.profile_output:
-                out = f"{args.profile_output}_{mode}_rank{rank}.json"
-                os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-                with open(out, "w") as f:
-                    _json.dump(prof, f, indent=2)
+        if args.prompt:
+            prompts = [args.prompt]
+        elif args.data_path:
+            with open(args.data_path) as f:
+                prompts = [l.strip() for l in f if l.strip()]
+        else:
+            raise ValueError("--prompt or --data_path required")
 
-            if rank == 0:
-                d_t = [r["d_ms"] for r in prof["diagonals"]]
-                a_t = [r["a_ms"] for r in prof["diagonals"]]
-                c_t = [r["c_ms"] for r in prof["diagonals"]]
-                print(f"\n  Profile [{mode}] (rank 0 / stage 0):")
-                print(f"    D (Denoise) : avg {np.mean(d_t):7.1f} ms, "
-                      f"total {np.sum(d_t):8.0f} ms")
-                print(f"    A (AddNoise): avg {np.mean(a_t):7.1f} ms, "
-                      f"total {np.sum(a_t):8.0f} ms")
-                print(f"    C (Cache)   : avg {np.mean(c_t):7.1f} ms, "
-                      f"total {np.sum(c_t):8.0f} ms")
-                dac_sum = [d + a + c for d, a, c in zip(d_t, a_t, c_t)]
-                print(f"    DA+C / step : avg {np.mean(dac_sum):7.1f} ms")
-
-        # Save video (rank 0 only)
-        if rank == 0:
-            video = pipeline.vae.decode_to_pixel(output, use_cache=False)
-            video = (video * 0.5 + 0.5).clamp(0, 1)
-            vout = rearrange(video, "b t c h w -> b t h w c").cpu()
-            vnp = (255.0 * vout[0]).clamp(0, 255).to(torch.uint8).numpy()
-
-            opath = args.output_path
-            if len(prompts) > 1:
-                base, ext = os.path.splitext(opath)
-                opath = f"{base}_{pidx}{ext}"
-            os.makedirs(os.path.dirname(opath) or ".", exist_ok=True)
-            imageio.mimwrite(opath, vnp, fps=16, quality=8)
-            print(f"Saved: {opath}")
-            pipeline.vae.model.clear_cache()
+        defer_rank0_save = len(prompts) == 1
+        deferred_save_payload = None
 
         dist.barrier()
 
-    dist.destroy_process_group()
+        for pidx, prompt in enumerate(prompts):
+            if rank == 0:
+                print(f"\n[{pidx + 1}/{len(prompts)}] {prompt[:80]}...")
+
+            num_frames = args.num_output_frames
+            nfpb = pipeline.num_frame_per_block
+            num_blocks = num_frames // nfpb
+
+            noise_bank = {}
+            gen = torch.Generator(device=device).manual_seed(args.noise_seed)
+            num_channels, height, width = pipeline.latent_shape
+            bshape = [1, nfpb, num_channels, height, width]
+            for s in range(num_stages):
+                for b in range(num_blocks):
+                    noise_bank[(s, b)] = torch.randn(
+                        bshape, device=device, dtype=torch.bfloat16,
+                        generator=gen)
+
+            run_fn = _run_dac if use_dac else _run_baseline
+            output, elapsed, prof_entries = run_fn(
+                pipeline, args, prompt, device, rank, my_stage, num_stages,
+                num_blocks, num_frames, noise_bank, args.profile)
+
+            if rank == 0:
+                print(f"Inference time: {elapsed:.2f}s "
+                      f"({num_blocks} blocks, {num_stages} stages)")
+
+            # Profiling summary
+            if args.profile and prof_entries:
+                mode = "dac" if use_dac else "baseline"
+                prof = _resolve_profile(prof_entries, rank, my_stage, mode)
+                prof["num_stages"] = num_stages
+                prof["num_blocks"] = num_blocks
+                prof["num_frames"] = num_frames
+                prof["total_time_s"] = elapsed
+
+                if args.profile_output:
+                    out = f"{args.profile_output}_{mode}_rank{rank}.json"
+                    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+                    with open(out, "w") as f:
+                        _json.dump(prof, f, indent=2)
+
+                if rank == 0:
+                    d_t = [r["d_ms"] for r in prof["diagonals"]]
+                    a_t = [r["a_ms"] for r in prof["diagonals"]]
+                    c_t = [r["c_ms"] for r in prof["diagonals"]]
+                    print(f"\n  Profile [{mode}] (rank 0 / stage 0):")
+                    print(f"    D (Denoise) : avg {np.mean(d_t):7.1f} ms, "
+                          f"total {np.sum(d_t):8.0f} ms")
+                    print(f"    A (AddNoise): avg {np.mean(a_t):7.1f} ms, "
+                          f"total {np.sum(a_t):8.0f} ms")
+                    print(f"    C (Cache)   : avg {np.mean(c_t):7.1f} ms, "
+                          f"total {np.sum(c_t):8.0f} ms")
+                    dac_sum = [d + a + c for d, a, c in zip(d_t, a_t, c_t)]
+                    print(f"    DA+C / step : avg {np.mean(dac_sum):7.1f} ms")
+
+            # Save video (rank 0 only)
+            if rank == 0:
+                opath = args.output_path
+                if len(prompts) > 1:
+                    base, ext = os.path.splitext(opath)
+                    opath = f"{base}_{pidx}{ext}"
+
+                if defer_rank0_save:
+                    deferred_save_payload = (output, opath)
+                else:
+                    _save_output_video_streaming(
+                        pipeline,
+                        output,
+                        opath,
+                        chunk_num_frames=args.vae_decode_chunk_size,
+                    )
+                    print(f"Saved: {opath}")
+
+            del noise_bank, prof_entries, output
+            gc.collect()
+
+            if not defer_rank0_save:
+                dist.barrier()
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    if rank == 0 and deferred_save_payload is not None:
+        output, opath = deferred_save_payload
+        if hasattr(pipeline, "generator"):
+            delattr(pipeline, "generator")
+        if hasattr(pipeline, "text_encoder"):
+            delattr(pipeline, "text_encoder")
+        gc.collect()
+        if output.is_cuda:
+            torch.cuda.empty_cache()
+
+        _save_output_video_streaming(
+            pipeline,
+            output,
+            opath,
+            chunk_num_frames=args.vae_decode_chunk_size,
+        )
+        print(f"Saved: {opath}")
+        del output
+        gc.collect()
 
 
 if __name__ == "__main__":

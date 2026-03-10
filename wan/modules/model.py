@@ -36,6 +36,14 @@ def rope_params(max_seq_len, dim, theta=10000):
     return freqs
 
 
+def build_3d_rope_freqs(max_seq_len, head_dim, theta=10000):
+    return torch.cat([
+        rope_params(max_seq_len, head_dim - 4 * (head_dim // 6), theta=theta),
+        rope_params(max_seq_len, 2 * (head_dim // 6), theta=theta),
+        rope_params(max_seq_len, 2 * (head_dim // 6), theta=theta)
+    ], dim=1)
+
+
 # @amp.autocast(enabled=False)
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -521,6 +529,7 @@ class WanModel(ModelMixin, ConfigMixin):
                  window_size=(-1, -1),
                  qk_norm=True,
                  cross_attn_norm=True,
+                 max_temporal_positions=1024,
                  eps=1e-6):
         r"""
         Initialize the diffusion model backbone.
@@ -576,6 +585,7 @@ class WanModel(ModelMixin, ConfigMixin):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
+        self.max_temporal_positions = max_temporal_positions
         self.eps = eps
         self.local_attn_size = 21
 
@@ -604,13 +614,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-            dim=1)
+        self.freqs = build_3d_rope_freqs(self.max_temporal_positions, dim // num_heads)
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
@@ -624,6 +628,20 @@ class WanModel(ModelMixin, ConfigMixin):
         if enable is not None:
             value = enable
         self.gradient_checkpointing = value
+
+    def _build_rope_freqs(self, max_temporal_positions, device):
+        return build_3d_rope_freqs(max_temporal_positions, self.dim // self.num_heads).to(device)
+
+    def _ensure_rope_capacity(self, required_frames, device):
+        required_frames = int(required_frames)
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
+        if required_frames <= self.freqs.shape[0]:
+            return
+
+        new_max_temporal_positions = max(required_frames, self.freqs.shape[0] * 2)
+        self.freqs = self._build_rope_freqs(new_max_temporal_positions, device)
+        self.max_temporal_positions = new_max_temporal_positions
 
     def forward(
         self,
@@ -675,8 +693,6 @@ class WanModel(ModelMixin, ConfigMixin):
             assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -685,9 +701,10 @@ class WanModel(ModelMixin, ConfigMixin):
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        self._ensure_rope_capacity(grid_sizes[:, 0].max().item(), device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        seq_len = max(seq_len, int(seq_lens.max().item()))
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
@@ -808,8 +825,6 @@ class WanModel(ModelMixin, ConfigMixin):
             assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -818,9 +833,10 @@ class WanModel(ModelMixin, ConfigMixin):
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        self._ensure_rope_capacity(grid_sizes[:, 0].max().item(), device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        seq_len = max(seq_len, int(seq_lens.max().item()))
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x

@@ -30,14 +30,19 @@ class CausalInferencePipeline(torch.nn.Module):
             timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        model = self.generator.model
+        self.num_transformer_blocks = len(model.blocks)
+        self.num_attention_heads = model.num_heads
+        self.attention_head_dim = model.dim // model.num_heads
+        self.text_context_len = model.text_len
+        self.patch_size = model.patch_size
+        self.frame_seq_length = None
 
         self.kv_cache1 = None
         self.args = args
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
-        self.local_attn_size = self.generator.model.local_attn_size
+        self.local_attn_size = model.local_attn_size
         self.use_ode_trajectory = getattr(args, "use_ode_trajectory", False)
         self.always_clean_context = getattr(args, "always_clean_context", False)
 
@@ -47,6 +52,15 @@ class CausalInferencePipeline(torch.nn.Module):
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
+
+    def _update_runtime_cache_spec(self, height, width):
+        patch_h = self.patch_size[1]
+        patch_w = self.patch_size[2]
+        if height % patch_h != 0 or width % patch_w != 0:
+            raise ValueError(
+                f"Latent spatial size ({height}, {width}) is incompatible with patch size {self.patch_size}"
+            )
+        self.frame_seq_length = (height // patch_h) * (width // patch_w)
 
     def inference(
         self,
@@ -74,6 +88,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._update_runtime_cache_spec(height, width)
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             # If the first frame is independent and the first frame is provided, then the number of frames in the
             # noise should still be a multiple of num_frame_per_block
@@ -293,8 +308,8 @@ class CausalInferencePipeline(torch.nn.Module):
 
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, kv_cache_size, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -309,8 +324,8 @@ class CausalInferencePipeline(torch.nn.Module):
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, self.text_context_len, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, self.text_context_len, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
@@ -359,6 +374,7 @@ class CausalInferencePipeline(torch.nn.Module):
                 It is normalized to be in the range [0, 1].
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._update_runtime_cache_spec(height, width)
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             assert num_frames % self.num_frame_per_block == 0
             num_blocks = num_frames // self.num_frame_per_block
@@ -888,6 +904,7 @@ class CausalInferencePipeline(torch.nn.Module):
             num_frame_first_blocks: number of leading blocks to denoise frame-first (default=1)
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._update_runtime_cache_spec(height, width)
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
             assert num_frames % self.num_frame_per_block == 0
             num_blocks = num_frames // self.num_frame_per_block
@@ -1222,6 +1239,7 @@ class CausalInferencePipeline(torch.nn.Module):
             video: (B, num_frames, C, H, W) generated video, range [0, 1]
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._update_runtime_cache_spec(height, width)
         
         # ---- 1. Compute number of blocks ----
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
@@ -1269,9 +1287,9 @@ class CausalInferencePipeline(torch.nn.Module):
             kv_cache = []
             for __ in range(self.num_transformer_blocks):
                 kv_cache.append({
-                    "k": torch.zeros([batch_size, kv_cache_size, 12, 128],
+                    "k": torch.zeros([batch_size, kv_cache_size, self.num_attention_heads, self.attention_head_dim],
                                      dtype=noise.dtype, device=noise.device),
-                    "v": torch.zeros([batch_size, kv_cache_size, 12, 128],
+                    "v": torch.zeros([batch_size, kv_cache_size, self.num_attention_heads, self.attention_head_dim],
                                      dtype=noise.dtype, device=noise.device),
                     "global_end_index": torch.tensor([0], dtype=torch.long, device=noise.device),
                     "local_end_index": torch.tensor([0], dtype=torch.long, device=noise.device),
@@ -1281,9 +1299,9 @@ class CausalInferencePipeline(torch.nn.Module):
             crossattn_cache = []
             for __ in range(self.num_transformer_blocks):
                 crossattn_cache.append({
-                    "k": torch.zeros([batch_size, 512, 12, 128],
+                    "k": torch.zeros([batch_size, self.text_context_len, self.num_attention_heads, self.attention_head_dim],
                                      dtype=noise.dtype, device=noise.device),
-                    "v": torch.zeros([batch_size, 512, 12, 128],
+                    "v": torch.zeros([batch_size, self.text_context_len, self.num_attention_heads, self.attention_head_dim],
                                      dtype=noise.dtype, device=noise.device),
                     "is_init": False,
                 })

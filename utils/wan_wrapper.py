@@ -86,6 +86,10 @@ class WanVAEWrapper(torch.nn.Module):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
+    def _get_scale(self, device, dtype):
+        return [self.mean.to(device=device, dtype=dtype),
+                1.0 / self.std.to(device=device, dtype=dtype)]
+
     def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
         # from [batch_size, num_frames, num_channels, height, width]
         # to [batch_size, num_channels, num_frames, height, width]
@@ -94,8 +98,7 @@ class WanVAEWrapper(torch.nn.Module):
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
 
         device, dtype = latent.device, latent.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
-                 1.0 / self.std.to(device=device, dtype=dtype)]
+        scale = self._get_scale(device=device, dtype=dtype)
 
         if use_cache:
             decode_function = self.model.cached_decode
@@ -110,6 +113,29 @@ class WanVAEWrapper(torch.nn.Module):
         # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
         return output
+
+    def iter_decode_to_pixel_chunks(self, latent: torch.Tensor, chunk_num_frames: int = 8):
+        if chunk_num_frames <= 0:
+            raise ValueError(f"chunk_num_frames must be positive, got {chunk_num_frames}")
+        if latent.shape[0] != 1:
+            raise ValueError("Chunked VAE decoding currently requires batch size 1")
+
+        # from [batch_size, num_frames, num_channels, height, width]
+        # to [batch_size, num_channels, num_frames, height, width]
+        zs = latent.permute(0, 2, 1, 3, 4)
+        device, dtype = latent.device, latent.dtype
+        scale = self._get_scale(device=device, dtype=dtype)
+
+        self.model.clear_cache()
+        try:
+            for start in range(0, zs.shape[2], chunk_num_frames):
+                z_chunk = zs[:, :, start:start + chunk_num_frames, :, :]
+                pixel_chunk = self.model.cached_decode(z_chunk, scale).float().clamp_(-1, 1)
+                # from [batch_size, num_channels, num_frames, height, width]
+                # to [batch_size, num_frames, num_channels, height, width]
+                yield pixel_chunk.permute(0, 2, 1, 3, 4)
+        finally:
+            self.model.clear_cache()
 
 
 class WanDiffusionWrapper(torch.nn.Module):

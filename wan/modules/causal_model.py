@@ -4,7 +4,7 @@ from wan.modules.model import (
     rope_apply,
     WanLayerNorm,
     WAN_CROSSATTENTION_CLASSES,
-    rope_params,
+    build_3d_rope_freqs,
     MLPProj,
     sinusoidal_embedding_1d
 )
@@ -452,6 +452,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  sink_size=0,
                  qk_norm=True,
                  cross_attn_norm=True,
+                 max_temporal_positions=1024,
                  eps=1e-6):
         r"""
         Initialize the diffusion model backbone.
@@ -509,6 +510,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.local_attn_size = local_attn_size
         self.qk_norm = qk_norm
         self.cross_attn_norm = cross_attn_norm
+        self.max_temporal_positions = max_temporal_positions
         self.eps = eps
 
         # embeddings
@@ -536,13 +538,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # buffers (don't use register_buffer otherwise dtype will be changed in to())
         assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-            dim=1)
+        self.freqs = build_3d_rope_freqs(self.max_temporal_positions, dim // num_heads)
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
@@ -561,6 +557,20 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if enable is not None:
             value = enable
         self.gradient_checkpointing = value
+
+    def _build_rope_freqs(self, max_temporal_positions, device):
+        return build_3d_rope_freqs(max_temporal_positions, self.dim // self.num_heads).to(device)
+
+    def _ensure_rope_capacity(self, required_frames, device):
+        required_frames = int(required_frames)
+        if self.freqs.device != device:
+            self.freqs = self.freqs.to(device)
+        if required_frames <= self.freqs.shape[0]:
+            return
+
+        new_max_temporal_positions = max(required_frames, self.freqs.shape[0] * 2)
+        self.freqs = self._build_rope_freqs(new_max_temporal_positions, device)
+        self.max_temporal_positions = new_max_temporal_positions
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -803,8 +813,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -813,9 +821,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        frame_seqlen = math.prod(grid_sizes[0][1:]).item()
+        start_frame = current_start // frame_seqlen if current_start is not None else 0
+        required_frames = start_frame + grid_sizes[:, 0].max().item()
+        self._ensure_rope_capacity(required_frames, device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        seq_len = max(seq_len, int(seq_lens.max().item()))
         x = torch.cat(x)
 
         # time embeddings
@@ -922,8 +934,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        if self.freqs.device != device:
-            self.freqs = self.freqs.to(device)
 
         # Construct blockwise causal attn mask
         if self.block_mask is None:
@@ -960,10 +970,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         grid_sizes = torch.stack(
             [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        self._ensure_rope_capacity(grid_sizes[:, 0].max().item(), device)
         x = [u.flatten(2).transpose(1, 2) for u in x]
 
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
-        assert seq_lens.max() <= seq_len
+        seq_len = max(seq_len, int(seq_lens.max().item()))
         x = torch.cat([
             torch.cat([u, u.new_zeros(1, seq_lens[0] - u.size(1), u.size(2))],
                       dim=1) for u in x
@@ -995,7 +1006,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             clean_x = [u.flatten(2).transpose(1, 2) for u in clean_x]
 
             seq_lens_clean = torch.tensor([u.size(1) for u in clean_x], dtype=torch.long)
-            assert seq_lens_clean.max() <= seq_len
+            seq_len = max(seq_len, int(seq_lens_clean.max().item()))
             clean_x = torch.cat([
                 torch.cat([u, u.new_zeros(1, seq_lens_clean[0] - u.size(1), u.size(2))], dim=1) for u in clean_x
             ])

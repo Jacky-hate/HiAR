@@ -6,6 +6,7 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+run_long_video.sh
 
 # Model weights & data (download separately)
 ckpts/

@@ -79,8 +79,13 @@ class TimestepForcingTrainingPipeline:
             self.denoising_step_list = self.denoising_step_list[:-1]
 
         # Wan specific hyperparameters
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        model = self.generator.model
+        self.num_transformer_blocks = len(model.blocks)
+        self.num_attention_heads = model.num_heads
+        self.attention_head_dim = model.dim // model.num_heads
+        self.text_context_len = model.text_len
+        self.patch_size = model.patch_size
+        self.frame_seq_length = None
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
         self.i2v = False
@@ -90,7 +95,8 @@ class TimestepForcingTrainingPipeline:
         self.independent_first_frame = independent_first_frame
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
-        self.kv_cache_size = num_max_frames * self.frame_seq_length
+        self.max_cache_frames = num_max_frames
+        self.kv_cache_size = None
         self.num_gradient_frames = num_gradient_frames
         self.use_ode_trajectory = use_ode_trajectory
         self.always_clean_context = always_clean_context
@@ -98,6 +104,16 @@ class TimestepForcingTrainingPipeline:
         assert denoising_order in ("timestep_first", "frame_first"), \
             f"denoising_order must be 'timestep_first' or 'frame_first', got: {denoising_order}"
         self.denoising_order = denoising_order
+
+    def _update_runtime_cache_spec(self, height: int, width: int):
+        patch_h = self.patch_size[1]
+        patch_w = self.patch_size[2]
+        if height % patch_h != 0 or width % patch_w != 0:
+            raise ValueError(
+                f"Latent spatial size ({height}, {width}) is incompatible with patch size {self.patch_size}"
+            )
+        self.frame_seq_length = (height // patch_h) * (width // patch_w)
+        self.kv_cache_size = self.max_cache_frames * self.frame_seq_length
 
     def generate_and_sync_list(self, num_blocks: int, num_denoising_steps: int, device: torch.device) -> List[int]:
         """
@@ -155,6 +171,7 @@ class TimestepForcingTrainingPipeline:
             denoised_timestep_to: Denoising end timestep
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self._update_runtime_cache_spec(height, width)
         
         # Compute number of blocks
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
@@ -604,8 +621,8 @@ class TimestepForcingTrainingPipeline:
 
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, self.kv_cache_size, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, self.kv_cache_size, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -618,8 +635,8 @@ class TimestepForcingTrainingPipeline:
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, self.text_context_len, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, self.text_context_len, self.num_attention_heads, self.attention_head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache

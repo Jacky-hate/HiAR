@@ -492,7 +492,7 @@
                 </div>
                 <div class="tldr-card">
                     <p>
-                        HiAR changes autoregressive video diffusion from <strong>block-first</strong> denoising to a <strong>step-first</strong> hierarchical schedule. Each block conditions on earlier blocks at the <strong>same noise level</strong>, which reduces long-horizon drift while preserving temporal continuity. The same dependency pattern also enables pipelined parallel inference, and a forward-KL regulariser helps keep motion diverse during self-rollout distillation.
+                        HiAR changes autoregressive video diffusion from <strong>block-first</strong> denoising to a <strong>step-first</strong> hierarchical schedule. Each block conditions on earlier blocks at the <strong>same noise level</strong>, which reduces long-horizon drift while preserving temporal continuity. This dependency pattern also facilitates pipelined parallel inference, while a dedicated forward-KL regulariser maintains motion diversity throughout self-rollout distillation—an essential requirement for training within this denoising paradigm.
                     </p>
                 </div>
             </div>

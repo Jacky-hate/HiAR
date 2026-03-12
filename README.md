@@ -123,13 +123,9 @@ torchrun --nnodes=8 --nproc_per_node=8 --rdzv_id=5235 \
 ```
 
 
-## Method Overview
-
-### Hierarchical Denoising
-Instead of fully denoising each video block before moving to the next (block-first), HiAR reverses the loop order to **step-first**: at each denoising step, all blocks are processed causally, with each block conditioned on previous blocks at the **same noise level**. This matched-noise context maximally attenuates inter-block error propagation.
-
-### Forward-KL Regularization
-To prevent the low-motion shortcut inherent to reverse-KL (DMD) distillation, a forward-KL regularizer is applied in bidirectional attention mode at the first denoising step, preserving motion diversity.
+---
+## Discussion & Limitations
+In essence, this method allows autoregressive video generation to mimic a bidirectional attention video denoising paradigm. For instance, the high-noise denoising stages only require coarse-grained context information. This design maximally reduces error accumulation while theoretically retaining sufficient information to maintain continuity. By scaling the training budget under the constraint of the Forward KL loss, we can achieve near-zero degradation in most scenarios, even enabling infinite generation (e.g., over 200 minutes). However, in some dynamic scenes, inter-frame jumping may still occur. We believe this is not an inherent limitation of the hierarchical denoising mechanism itself, but rather an issue of insufficient capacity in the 1.3B base model, as this denoising paradigm is considerably more challenging. We plan to further validate this mechanism on more powerful base models in the future.
 
 ## Acknowledgements
 This codebase is built on [Self-Forcing](https://github.com/self-forcing/Self-Forcing), [CausVid](https://github.com/tianweiy/CausVid), and [Wan2.1](https://github.com/Wan-Video/Wan2.1).

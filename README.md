@@ -132,13 +132,10 @@ This codebase is built on [Self-Forcing](https://github.com/self-forcing/Self-Fo
 
 ## Citation
 ```bibtex
-@misc{zou2026hiarefficientautoregressivelong,
-      title={HiAR: Efficient Autoregressive Long Video Generation via Hierarchical Denoising}, 
-      author={Kai Zou and Dian Zheng and Hongbo Liu and Tiankai Hang and Bin Liu and Nenghai Yu},
-      year={2026},
-      eprint={2603.08703},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2603.08703}, 
+@article{zou2026hiar,
+  title={HiAR: Efficient Autoregressive Long Video Generation via Hierarchical Denoising},
+  author={Zou, Kai and Zheng, Dian and Liu, Hongbo and Hang, Tiankai and Liu, Bin and Yu, Nenghai},
+  journal={arXiv preprint arXiv:2603.08703},
+  year={2026}
 }
 ```

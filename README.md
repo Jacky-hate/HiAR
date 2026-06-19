@@ -1,6 +1,7 @@
 <p align="center">
 <h1 align="center">HiAR</h1>
 <h3 align="center">Hierarchical Autoregressive Video Generation with Pipelined Parallel Inference</h3>
+<h2 align="center">ECCV 2026 </h1>
 </p>
 <p align="center">
   <h3 align="center"><a href="https://arxiv.org/abs/2603.08703">arXiv</a> | <a href="https://jacky-hate.github.io/HiAR/">Website</a> | <a href="https://huggingface.co/jackyhate/HiAR/tree/main">Model</a></h3>

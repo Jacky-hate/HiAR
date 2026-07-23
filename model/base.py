@@ -36,6 +36,23 @@ class BaseModel(nn.Module):
         self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
         self.fake_score.model.requires_grad_(True)
 
+        self.bidirectional_cd_enabled = bool(
+            getattr(args, "bidirectional_cd_enabled", False)
+        )
+        self.bidirectional_cd_ema = None
+        if self.bidirectional_cd_enabled:
+            # A separate frozen target is required: swapping EMA weights into
+            # the live student between forward and backward invalidates
+            # autograd/FSDP version counters.
+            self.bidirectional_cd_ema = WanDiffusionWrapper(
+                model_name=self.fake_model_name,
+                is_causal=True,
+                empty_init=True,
+                **getattr(args, "model_kwargs", {}),
+            )
+            self.bidirectional_cd_ema.requires_grad_(False)
+            self.bidirectional_cd_ema.eval()
+
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
 
@@ -129,31 +146,74 @@ class SelfForcingModel(BaseModel):
         """
         # Step 1: Sample noise and backward simulate the generator's input
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
+        conditional_dict = dict(conditional_dict)
         if initial_latent is not None:
             conditional_dict["initial_latent"] = initial_latent
-        if self.args.i2v:
-            noise_shape = [image_or_video_shape[0], image_or_video_shape[1] - 1, *image_or_video_shape[2:]]
-        else:
-            noise_shape = image_or_video_shape.copy()
 
         # During training, the number of generated frames should be uniformly sampled from
         # [num_training_frames, num_rollout_frames], but still being a multiple of num_frame_per_block
         num_grad_frames = self.num_training_frames  # Number of frames for gradient/loss computation (e.g., 21)
-        min_num_frames = (num_grad_frames - 1) if self.args.independent_first_frame else num_grad_frames
-        max_num_frames = (self.num_rollout_frames - 1) if self.args.independent_first_frame else self.num_rollout_frames
-        assert max_num_frames % self.num_frame_per_block == 0
-        assert min_num_frames % self.num_frame_per_block == 0
-        max_num_blocks = max_num_frames // self.num_frame_per_block
-        min_num_blocks = min_num_frames // self.num_frame_per_block
-        num_generated_blocks = torch.randint(min_num_blocks, max_num_blocks + 1, (1,), device=self.device)
+        context_frames = 1 if initial_latent is not None else 0
+        layout_offset = int(
+            context_frames > 0 or bool(self.args.independent_first_frame)
+        )
+        min_block_frames = num_grad_frames - layout_offset
+        max_block_frames = self.num_rollout_frames - layout_offset
+        if (
+            min_block_frames <= 0
+            or min_block_frames % self.num_frame_per_block
+            or max_block_frames % self.num_frame_per_block
+        ):
+            raise ValueError(
+                "Invalid rollout layout: total frame counts minus the "
+                f"{layout_offset}-frame context/singleton prefix must be "
+                f"multiples of block size {self.num_frame_per_block}"
+            )
+        max_num_blocks = max_block_frames // self.num_frame_per_block
+        min_num_blocks = min_block_frames // self.num_frame_per_block
+        fixed_rollout_frames = int(
+            getattr(self.args, "fixed_rollout_frames", 0)
+        )
+        if fixed_rollout_frames < 0:
+            raise ValueError("fixed_rollout_frames must be non-negative")
+        if fixed_rollout_frames > 0:
+            fixed_block_frames = fixed_rollout_frames - layout_offset
+            if (
+                fixed_rollout_frames < num_grad_frames
+                or fixed_rollout_frames > self.num_rollout_frames
+                or fixed_block_frames % self.num_frame_per_block
+            ):
+                raise ValueError(
+                    "fixed_rollout_frames must be within "
+                    f"[{num_grad_frames}, {self.num_rollout_frames}] and its "
+                    f"layout-adjusted length must be divisible by block size "
+                    f"{self.num_frame_per_block}; got {fixed_rollout_frames}"
+                )
+            num_generated_blocks = torch.tensor(
+                [fixed_block_frames // self.num_frame_per_block],
+                device=self.device,
+                dtype=torch.long,
+            )
+        else:
+            num_generated_blocks = torch.randint(
+                min_num_blocks,
+                max_num_blocks + 1,
+                (1,),
+                device=self.device,
+            )
         dist.broadcast(num_generated_blocks, src=0)
         num_generated_blocks = num_generated_blocks.item()
-        num_generated_frames = num_generated_blocks * self.num_frame_per_block
-        if self.args.independent_first_frame and initial_latent is None:
-            num_generated_frames += 1
-            min_num_frames += 1
-        # Sync num_generated_frames across all processes
-        noise_shape[1] = num_generated_frames
+        num_output_frames = (
+            layout_offset + num_generated_blocks * self.num_frame_per_block
+        )
+        # I2V supplies its context separately; independent-first-frame T2V
+        # includes the singleton first frame in the sampled noise itself.
+        num_noise_frames = num_output_frames - context_frames
+        noise_shape = [
+            image_or_video_shape[0],
+            num_noise_frames,
+            *image_or_video_shape[2:],
+        ]
 
         pred_image_or_video, denoised_timestep_from, denoised_timestep_to = self._consistency_backward_simulation(
             noise=torch.randn(noise_shape,
@@ -162,13 +222,13 @@ class SelfForcingModel(BaseModel):
         )
         # Slice last num_training_frames frames for loss computation
         num_tail = num_grad_frames - 1  # Number of tail frames when concatenating using VAE re-encoding
-        if pred_image_or_video.shape[1] > num_grad_frames:
+        did_reencode = pred_image_or_video.shape[1] > num_grad_frames
+        if did_reencode:
             with torch.no_grad():
                 # Reencode to get image latent at the boundary
                 latent_to_decode = pred_image_or_video[:, :-num_tail, ...]
                 # Decode to video
-                pixels = self.vae.decode_to_pixel(latent_to_decode)
-                frame = pixels[:, -1:, ...].to(self.dtype)
+                frame = self.vae.decode_last_frame(latent_to_decode).to(self.dtype)
                 frame = rearrange(frame, "b t c h w -> b c t h w")
                 # Encode frame to get image latent
                 image_latent = self.vae.encode_to_latent(frame).to(self.dtype)
@@ -176,15 +236,46 @@ class SelfForcingModel(BaseModel):
         else:
             pred_image_or_video_last_21 = pred_image_or_video
 
-        if num_generated_frames != min_num_frames:
-            # Currently, we do not use gradient for the first chunk, since it contains image latents
+        if did_reencode or initial_latent is not None:
+            # The re-encoded boundary (or external I2V context) is detached.
+            # In the regular block layout the remainder of its partial block is
+            # also excluded so every active region is a complete causal block.
             gradient_mask = torch.ones_like(pred_image_or_video_last_21, dtype=torch.bool)
-            if self.args.independent_first_frame:
-                gradient_mask[:, :1] = False
+            if did_reencode:
+                masked_prefix = (
+                    1
+                    if self.args.independent_first_frame or initial_latent is not None
+                    else self.num_frame_per_block
+                )
             else:
-                gradient_mask[:, :self.num_frame_per_block] = False
+                masked_prefix = initial_latent.shape[1]
+            gradient_mask[:, :masked_prefix] = False
         else:
             gradient_mask = None
+
+        if gradient_mask is None:
+            active_gradient_frames = num_grad_frames
+        else:
+            # The mask is spatially/channel uniform by construction; record
+            # the per-sample active temporal support for auditable smokes.
+            active_gradient_frames = int(
+                gradient_mask[:, :, 0, 0, 0]
+                .sum(dim=1)
+                .float()
+                .mean()
+                .item()
+            )
+        self._last_rollout_metadata = {
+            "rollout_actual_frames": torch.tensor(
+                float(num_output_frames), device=self.device
+            ),
+            "rollout_did_reencode": torch.tensor(
+                float(did_reencode), device=self.device
+            ),
+            "rollout_active_gradient_frames": torch.tensor(
+                float(active_gradient_frames), device=self.device
+            ),
+        }
 
         pred_image_or_video_last_21 = pred_image_or_video_last_21.to(self.dtype)
         return pred_image_or_video_last_21, gradient_mask, denoised_timestep_from, denoised_timestep_to

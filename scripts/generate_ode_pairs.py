@@ -10,18 +10,20 @@ Usage (multi-GPU with torchrun):
         --output_folder data/ode_pairs \
         --caption_path data/vidprom_filtered_extended.txt \
         --guidance_scale 6.0 \
-        --num_inference_steps 48 \
-        --num_prompts 10000
+        --num_inference_steps 50 \
+        --num_prompts 20000
 
-Recommended: 10K-50K pairs for distillation initialization.
+The saved points are interpolated at the student's exact four-step sigmas.
 """
 from utils.distributed import launch_distributed_job
 from utils.scheduler import FlowMatchScheduler
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
 from utils.dataset import TextDataset
+from utils.pd_schedule import interpolate_trajectory, shifted_student_sigmas
 import torch.distributed as dist
 from tqdm import tqdm
 import argparse
+import json
 import torch
 import math
 import os
@@ -99,12 +101,22 @@ def main():
                         help="Path to prompt text file (one prompt per line)")
     parser.add_argument("--guidance_scale", type=float, default=6.0,
                         help="Classifier-Free Guidance scale")
-    parser.add_argument("--num_inference_steps", type=int, default=48,
+    parser.add_argument("--num_inference_steps", type=int, default=50,
                         help="Number of ODE sampling steps")
     parser.add_argument("--num_prompts", type=int, default=-1,
                         help="Number of prompts to use (-1 for all)")
-    parser.add_argument("--save_indices", type=str, default="0,12,24,36,-1",
-                        help="Timestep indices to save (comma-separated)")
+    parser.add_argument(
+        "--student_denoising_steps",
+        type=str,
+        default="1000,750,500,250,0",
+        help="Nominal student timesteps whose exact sigmas are saved",
+    )
+    parser.add_argument(
+        "--student_timestep_shift",
+        type=float,
+        default=5.0,
+        help="Student flow-matching timestep shift",
+    )
     parser.add_argument("--latent_shape", type=str, default="1,21,16,60,104",
                         help="Latent tensor shape (comma-separated)")
     parser.add_argument("--num_frames", type=int, default=21)
@@ -125,7 +137,10 @@ def main():
     logger.info(f"Distributed init: rank={rank}, world_size={world_size}, device=cuda:{device}")
 
     latent_shape = list(map(int, args.latent_shape.split(",")))
-    save_indices = list(map(int, args.save_indices.split(",")))
+    student_steps = list(map(int, args.student_denoising_steps.split(",")))
+    aligned_sigmas = shifted_student_sigmas(
+        student_steps, args.student_timestep_shift
+    )
     num_frames = args.num_frames
 
     torch.manual_seed(args.seed + rank)
@@ -141,6 +156,44 @@ def main():
         timestep_shift=args.timestep_shift
     )
     logger.info("Model loaded")
+
+    manifest = {
+        "format_version": 2,
+        "teacher_model": args.model_name,
+        "teacher_timestep_shift": args.timestep_shift,
+        "teacher_num_inference_steps": args.num_inference_steps,
+        "guidance_scale": args.guidance_scale,
+        "student_timestep_shift": args.student_timestep_shift,
+        "student_denoising_steps": student_steps,
+        "aligned_sigmas": aligned_sigmas,
+        "latent_shape": latent_shape,
+        "dtype": "float32",
+    }
+    manifest_error = None
+    if rank == 0:
+        manifest_path = os.path.join(args.output_folder, "manifest.json")
+        try:
+            if os.path.isfile(manifest_path):
+                with open(manifest_path, encoding="utf-8") as handle:
+                    existing_manifest = json.load(handle)
+                if existing_manifest != manifest:
+                    raise RuntimeError(
+                        "Existing manifest does not match requested ODE settings"
+                    )
+            else:
+                temporary_manifest = manifest_path + ".tmp"
+                with open(temporary_manifest, "w", encoding="utf-8") as handle:
+                    json.dump(manifest, handle, indent=2, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_manifest, manifest_path)
+        except Exception as exc:
+            manifest_error = f"{type(exc).__name__}: {exc}"
+    payload = [manifest_error]
+    dist.broadcast_object_list(payload, src=0)
+    if payload[0] is not None:
+        raise RuntimeError(f"Failed to initialize ODE manifest: {payload[0]}")
+    dist.barrier()
 
     dataset = TextDataset(args.caption_path)
     total_prompts = len(dataset)
@@ -206,13 +259,34 @@ def main():
                 ).unflatten(dim=0, sizes=flow_pred.shape[:2])
 
             noisy_input.append(latents)
-            noisy_inputs = torch.stack(noisy_input, dim=1)
-            noisy_inputs = noisy_inputs[:, save_indices]
+            full_trajectory = torch.stack(noisy_input, dim=1)
+            trajectory_sigmas = torch.cat([
+                scheduler.sigmas,
+                scheduler.sigmas.new_zeros(1),
+            ])
+            noisy_inputs = interpolate_trajectory(
+                full_trajectory, trajectory_sigmas, aligned_sigmas
+            )
 
+            final_path = os.path.join(
+                args.output_folder, f"{prompt_index:05d}.pt"
+            )
+            temporary_path = final_path + f".tmp.rank{rank}"
             torch.save(
                 {prompt: noisy_inputs.cpu().detach()},
-                os.path.join(args.output_folder, f"{prompt_index:05d}.pt")
+                temporary_path,
             )
+            # Read back before publishing so resume never accepts a partial file.
+            validation = torch.load(
+                temporary_path, map_location="cpu", weights_only=True
+            )
+            saved_latent = next(iter(validation.values()))
+            if (
+                saved_latent.shape[1] != len(aligned_sigmas)
+                or not torch.isfinite(saved_latent).all()
+            ):
+                raise RuntimeError("ODE pair readback validation failed")
+            os.replace(temporary_path, final_path)
             processed += 1
 
         except Exception as e:

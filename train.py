@@ -1,7 +1,10 @@
 import argparse
 import os
 from omegaconf import OmegaConf
-import wandb
+try:
+    import wandb
+except ModuleNotFoundError:
+    wandb = None
 
 from trainer import ScoreDistillationTrainer
 
@@ -20,6 +23,30 @@ def main():
     parser.add_argument("--min_exit_step", type=int, default=None,
                         help="Override min_exit_step in config. Controls the minimum exit step index "
                              "(i.e. randint low), e.g. 2 means skip step 0 and 1")
+    parser.add_argument(
+        "--max_steps",
+        type=int,
+        default=None,
+        help="Stop when the absolute global outer-step reaches this value",
+    )
+    parser.add_argument(
+        "--total_batch_size",
+        type=int,
+        default=None,
+        help="Override the global batch size used to derive accumulation",
+    )
+    parser.add_argument(
+        "--num_rollout_frames",
+        type=int,
+        default=None,
+        help="Override rollout length for long-rollout validation/training",
+    )
+    parser.add_argument(
+        "--fixed_rollout_frames",
+        type=int,
+        default=None,
+        help="Force an exact rollout length instead of uniform length sampling",
+    )
 
     args = parser.parse_args()
 
@@ -40,11 +67,20 @@ def main():
 
     if args.min_exit_step is not None:
         config.min_exit_step = args.min_exit_step
+    if args.max_steps is not None:
+        config.max_steps = args.max_steps
+    if args.total_batch_size is not None:
+        config.total_batch_size = args.total_batch_size
+    if args.num_rollout_frames is not None:
+        config.num_rollout_frames = args.num_rollout_frames
+    if args.fixed_rollout_frames is not None:
+        config.fixed_rollout_frames = args.fixed_rollout_frames
 
     trainer = ScoreDistillationTrainer(config)
     trainer.train()
 
-    wandb.finish()
+    if wandb is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":

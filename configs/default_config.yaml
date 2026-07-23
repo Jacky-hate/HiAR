@@ -11,10 +11,38 @@ last_step_only: false
 i2v: false
 num_training_frames: 21
 num_rollout_frames: 0  # 0 means equal to num_training_frames
+fixed_rollout_frames: 0  # 0 samples uniformly; positive forces an exact length
 gc_interval: 100
+max_steps: 0  # 0 means run until externally stopped
 context_noise: 0
+dmd_normalizer_eps: 1.0e-6
 causal: true
 denoising_order: timestep_first
+
+# Independent training side-effect cadences. Set checkpoint/eval to 0 to disable.
+log_interval: 1
+checkpoint_interval: 100
+max_checkpoints_to_keep: 5
+eval_interval: 100
+eval_num_prompts: 1
+eval_num_frames: 21
+eval_fps: 16
+ema_device: cpu
+pd_require_manifest: true
+bidirectional_cd_enabled: false
+bidirectional_cd_loss_weight: 0.1
+bidirectional_cd_num_timesteps: 48
+bidirectional_cd_timestep_shift: 5.0
+bidirectional_cd_guidance_scale: 3.0
+bidirectional_cd_ema_decay: 0.99
+bidirectional_cd_sft_weight: 0.0
+sync_each_microbatch: false
+# Model/optimizer state can be resharded, but sampler ownership cannot be
+# continued exactly at a different world size. Require an explicit opt-in.
+allow_data_restart_on_reshard: false
+# Optional local source/category filters. Keep public configs empty; private
+# experiment configs may provide normalized substring patterns.
+data_exclude_metadata_patterns: []
 
 ckpt_step: 0
 height: 480

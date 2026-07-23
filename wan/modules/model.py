@@ -172,15 +172,33 @@ class WanT2VCrossAttention(WanSelfAttention):
         q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         if crossattn_cache is not None:
+            cache_batch = int(crossattn_cache.get("batch_size", b))
+            if b % cache_batch != 0:
+                raise ValueError(
+                    f"cross-attention query batch {b} is not divisible by cache batch {cache_batch}"
+                )
             if not crossattn_cache["is_init"]:
+                base_context = context[:cache_batch]
+                new_k = self.norm_k(self.k(base_context)).view(cache_batch, -1, n, d)
+                new_v = self.v(base_context).view(cache_batch, -1, n, d)
+                if (
+                    crossattn_cache.get("k") is None
+                    or crossattn_cache["k"].shape != new_k.shape
+                    or crossattn_cache["k"].device != new_k.device
+                    or crossattn_cache["k"].dtype != new_k.dtype
+                ):
+                    crossattn_cache["k"] = torch.empty_like(new_k)
+                    crossattn_cache["v"] = torch.empty_like(new_v)
+                with torch.no_grad():
+                    crossattn_cache["k"].copy_(new_k.detach())
+                    crossattn_cache["v"].copy_(new_v.detach())
                 crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
-                crossattn_cache["k"] = k
-                crossattn_cache["v"] = v
-            else:
-                k = crossattn_cache["k"]
-                v = crossattn_cache["v"]
+            repeat_factor = b // cache_batch
+            k = crossattn_cache["k"]
+            v = crossattn_cache["v"]
+            if repeat_factor > 1:
+                k = k.repeat(repeat_factor, 1, 1, 1)
+                v = v.repeat(repeat_factor, 1, 1, 1)
         else:
             k = self.norm_k(self.k(context)).view(b, -1, n, d)
             v = self.v(context).view(b, -1, n, d)

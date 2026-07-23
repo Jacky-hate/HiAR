@@ -17,18 +17,28 @@ class DMD(SelfForcingModel):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.same_step_across_blocks = getattr(args, "same_step_across_blocks", True)
         self.num_training_frames = getattr(args, "num_training_frames", 21)
+        self.independent_first_frame = getattr(args, "independent_first_frame", False)
         # num_rollout_frames: total rollout frames (can be greater than num_training_frames), 0 means equal to num_training_frames
         _rollout = getattr(args, "num_rollout_frames", 0)
         self.num_rollout_frames = _rollout if _rollout > 0 else self.num_training_frames
         assert self.num_rollout_frames >= self.num_training_frames, \
             f"num_rollout_frames ({self.num_rollout_frames}) must be >= num_training_frames ({self.num_training_frames})"
-        assert self.num_rollout_frames % self.num_frame_per_block == 0, \
-            f"num_rollout_frames ({self.num_rollout_frames}) must be a multiple of num_frame_per_block ({self.num_frame_per_block})"
+        # Frame counts are total output frames. I2V and independent-first-frame
+        # layouts reserve one context/singleton frame before regular blocks.
+        frame_offset = int(bool(getattr(args, "i2v", False)) or self.independent_first_frame)
+        for name, count in (
+            ("num_training_frames", self.num_training_frames),
+            ("num_rollout_frames", self.num_rollout_frames),
+        ):
+            if count <= frame_offset or (count - frame_offset) % self.num_frame_per_block:
+                raise ValueError(
+                    f"{name} ({count}) must satisfy ({name} - {frame_offset}) "
+                    f"% num_frame_per_block ({self.num_frame_per_block}) == 0"
+                )
 
         if self.num_frame_per_block > 1:
             self.generator.model.num_frame_per_block = self.num_frame_per_block
 
-        self.independent_first_frame = getattr(args, "independent_first_frame", False)
         if self.independent_first_frame:
             self.generator.model.independent_first_frame = True
         if args.gradient_checkpointing:
@@ -52,6 +62,14 @@ class DMD(SelfForcingModel):
         self.ts_schedule = getattr(args, "ts_schedule", True)
         self.ts_schedule_max = getattr(args, "ts_schedule_max", False)
         self.min_score_timestep = getattr(args, "min_score_timestep", 0)
+        self.dmd_normalizer_eps = float(
+            getattr(args, "dmd_normalizer_eps", 1.0e-6)
+        )
+        if self.dmd_normalizer_eps <= 0:
+            raise ValueError(
+                "dmd_normalizer_eps must be positive, got "
+                f"{self.dmd_normalizer_eps}"
+            )
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:
             self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
@@ -63,7 +81,8 @@ class DMD(SelfForcingModel):
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
         conditional_dict: dict, unconditional_dict: dict,
-        normalization: bool = True
+        normalization: bool = True,
+        gradient_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -122,10 +141,34 @@ class DMD(SelfForcingModel):
         # TODO: Change the normalizer for causal teacher
         if normalization:
             # Step 4: Gradient normalization (DMD paper eq. 8).
-            p_real = (estimated_clean_image_or_video - pred_real_image)
-            normalizer = torch.abs(p_real).mean(dim=[1, 2, 3, 4], keepdim=True)
-            grad = grad / normalizer
-        grad = torch.nan_to_num(grad)
+            p_real = (
+                estimated_clean_image_or_video.float()
+                - pred_real_image.float()
+            ).abs()
+            if gradient_mask is None:
+                active = torch.ones_like(p_real, dtype=torch.bool)
+            else:
+                if gradient_mask.shape != p_real.shape:
+                    raise ValueError(
+                        "gradient_mask shape must match the DMD latent: "
+                        f"{gradient_mask.shape} != {p_real.shape}"
+                    )
+                active = gradient_mask
+            # Excluded boundary frames must not affect Eq. 8 normalization.
+            # Ignore non-finite score values when computing the scale; their
+            # corresponding gradient elements are zeroed below.
+            finite_active = active & torch.isfinite(p_real)
+            reduce_dims = tuple(range(1, p_real.ndim))
+            normalizer = torch.where(
+                finite_active, p_real, torch.zeros_like(p_real)
+            ).sum(dim=reduce_dims, keepdim=True)
+            active_count = finite_active.sum(
+                dim=reduce_dims, keepdim=True
+            ).clamp_min(1)
+            normalizer = normalizer / active_count
+            grad = grad / normalizer.clamp_min(self.dmd_normalizer_eps)
+        # Invalid score predictions must not become dtype-max gradients.
+        grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
 
         return grad, {
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
@@ -189,10 +232,13 @@ class DMD(SelfForcingModel):
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
                 conditional_dict=conditional_dict,
-                unconditional_dict=unconditional_dict
+                unconditional_dict=unconditional_dict,
+                gradient_mask=gradient_mask,
             )
 
         if gradient_mask is not None:
+            if not torch.any(gradient_mask):
+                raise ValueError("gradient_mask excludes the entire DMD sample")
             dmd_loss = 0.5 * F.mse_loss(original_latent.double(
             )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
         else:
@@ -238,6 +284,7 @@ class DMD(SelfForcingModel):
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to
         )
+        dmd_log_dict.update(self._last_rollout_metadata)
 
         return dmd_loss, dmd_log_dict
 
@@ -297,7 +344,7 @@ class DMD(SelfForcingModel):
             critic_timestep.flatten(0, 1)
         ).unflatten(0, image_or_video_shape[:2])
 
-        _, pred_fake_image = self.fake_score(
+        flow_pred, pred_fake_image = self.fake_score(
             noisy_image_or_video=noisy_generated_image,
             conditional_dict=conditional_dict,
             timestep=critic_timestep
@@ -305,13 +352,9 @@ class DMD(SelfForcingModel):
 
         # Step 3: Compute the denoising loss for the fake critic
         if self.args.denoising_loss_type == "flow":
-            from utils.wan_wrapper import WanDiffusionWrapper
-            flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
-                scheduler=self.scheduler,
-                x0_pred=pred_fake_image.flatten(0, 1),
-                xt=noisy_generated_image.flatten(0, 1),
-                timestep=critic_timestep.flatten(0, 1)
-            )
+            # Use the score model's native flow output. Reconstructing flow from
+            # a bf16 x0 prediction amplifies quantization error by 1 / sigma.
+            flow_pred = flow_pred.flatten(0, 1)
             pred_fake_noise = None
         else:
             flow_pred = None

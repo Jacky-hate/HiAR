@@ -16,7 +16,7 @@ from PIL import Image
 try:
     from flash_attn import flash_attn_varlen_func
     FLASH_VER = 2
-except ModuleNotFoundError:
+except (ImportError, OSError):
     flash_attn_varlen_func = None  # in compatible with CPU machines
     FLASH_VER = None
 

@@ -43,6 +43,7 @@ class TimestepForcingTrainingPipeline:
                  always_clean_context: bool = False,
                  min_exit_step: int = 0,
                  denoising_order: str = "timestep_first",
+                 enable_denoise_cache_fusion: bool = True,
                  **kwargs):
         """
         Args:
@@ -78,26 +79,43 @@ class TimestepForcingTrainingPipeline:
         if self.denoising_step_list[-1] == 0:
             self.denoising_step_list = self.denoising_step_list[:-1]
 
-        # Wan specific hyperparameters
-        self.num_transformer_blocks = 30
-        self.frame_seq_length = 1560
+        # Wan cache geometry is derived from the loaded backbone instead of
+        # hard-coding the 1.3B layout.
+        generator_wrapper = getattr(generator, "module", generator)
+        backbone = generator_wrapper.model
+        self.num_transformer_blocks = len(backbone.blocks)
+        self.num_attention_heads = backbone.num_heads
+        self.attention_head_dim = backbone.dim // backbone.num_heads
+        self.text_cache_length = backbone.text_len
+        self.patch_size = tuple(backbone.patch_size)
+        self.frame_seq_length = generator_wrapper.seq_len // 21
         self.num_frame_per_block = num_frame_per_block
         self.context_noise = context_noise
         self.i2v = False
 
         self.kv_cache1 = None
         self.kv_cache2 = None
+        self.crossattn_cache = None
         self.independent_first_frame = independent_first_frame
         self.same_step_across_blocks = same_step_across_blocks
         self.last_step_only = last_step_only
+        self.num_max_frames = num_max_frames
         self.kv_cache_size = num_max_frames * self.frame_seq_length
+        self._kv_cache_spec = None
+        self._crossattn_cache_spec = None
         self.num_gradient_frames = num_gradient_frames
         self.use_ode_trajectory = use_ode_trajectory
         self.always_clean_context = always_clean_context
         self.min_exit_step = min_exit_step
         assert denoising_order in ("timestep_first", "frame_first"), \
             f"denoising_order must be 'timestep_first' or 'frame_first', got: {denoising_order}"
+        if denoising_order == "timestep_first" and not same_step_across_blocks:
+            raise ValueError(
+                "timestep_first requires same_step_across_blocks=true; "
+                "asynchronous block exits are only defined for frame_first"
+            )
         self.denoising_order = denoising_order
+        self.enable_denoise_cache_fusion = enable_denoise_cache_fusion
 
     def generate_and_sync_list(self, num_blocks: int, num_denoising_steps: int, device: torch.device) -> List[int]:
         """
@@ -126,7 +144,8 @@ class TimestepForcingTrainingPipeline:
         else:
             indices = torch.empty(num_blocks, dtype=torch.long, device=device)
 
-        dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
+        if dist.is_initialized():
+            dist.broadcast(indices, src=0)  # Broadcast the random indices to all ranks
         return indices.tolist()
 
     def inference_with_trajectory(
@@ -155,6 +174,10 @@ class TimestepForcingTrainingPipeline:
             denoised_timestep_to: Denoising end timestep
         """
         batch_size, num_frames, num_channels, height, width = noise.shape
+        self.frame_seq_length = (
+            height * width // (self.patch_size[1] * self.patch_size[2])
+        )
+        self.kv_cache_size = self.num_max_frames * self.frame_seq_length
         
         # Compute number of blocks
         if not self.independent_first_frame or (self.independent_first_frame and initial_latent is not None):
@@ -175,13 +198,15 @@ class TimestepForcingTrainingPipeline:
             dtype=noise.dtype
         )
 
-        # Step 1: Initialize KV cache to all zeros
+        # Step 1: Allocate caches only when their geometry changes, then reset
+        # lightweight cursors. K/V storage is intentionally not zeroed.
         self._initialize_kv_cache(
             batch_size=batch_size, dtype=noise.dtype, device=noise.device
         )
         self._initialize_crossattn_cache(
             batch_size=batch_size, dtype=noise.dtype, device=noise.device
         )
+        self._reset_kv_cache(noise.device, reset_cross_attention=True)
 
         # Step 2: Cache context feature
         current_start_frame = 0
@@ -220,6 +245,14 @@ class TimestepForcingTrainingPipeline:
         # Generate exit step list (aligned with SelfForcingTrainingPipeline)
         exit_flags = self.generate_and_sync_list(len(all_num_frames), num_denoising_steps, device=noise.device)
         start_gradient_frame_index = num_output_frames - self.num_gradient_frames
+        if num_output_frames > self.num_gradient_frames:
+            # The boundary is decoded/re-encoded and masked from the final
+            # loss. Avoid constructing an autograd graph for that dead prefix.
+            start_gradient_frame_index += (
+                1
+                if self.independent_first_frame or initial_latent is not None
+                else self.num_frame_per_block
+            )
 
         # ========== Dispatch to different loops based on denoising_order ==========
         if self.denoising_order == "timestep_first":
@@ -292,13 +325,97 @@ class TimestepForcingTrainingPipeline:
                 noisy_input.flatten(0, 1),
                 target_timestep=next_timestep
             ).unflatten(0, denoised_pred.shape[:2])
-        else:
-            return self.scheduler.add_noise(
-                denoised_pred.flatten(0, 1),
-                torch.randn_like(denoised_pred.flatten(0, 1)),
-                next_timestep * torch.ones(
-                    [batch_size * current_num_frames], device=device, dtype=torch.long)
-            ).unflatten(0, denoised_pred.shape[:2])
+        return self.scheduler.add_noise(
+            denoised_pred.flatten(0, 1),
+            torch.randn_like(denoised_pred.flatten(0, 1)),
+            next_timestep * torch.ones(
+                [batch_size * current_num_frames], device=device, dtype=torch.long)
+        ).unflatten(0, denoised_pred.shape[:2])
+
+    @staticmethod
+    def _duplicate_conditioning(conditional_dict: dict) -> dict:
+        """Duplicate batch-shaped conditioning for a two-half fused forward."""
+        duplicated = {}
+        for key, value in conditional_dict.items():
+            if torch.is_tensor(value):
+                duplicated[key] = torch.cat([value, value], dim=0)
+            elif isinstance(value, list):
+                duplicated[key] = value + value
+            else:
+                duplicated[key] = value
+        return duplicated
+
+    def _write_pending_cache(self, pending_cache: Optional[dict], conditional_dict: dict):
+        if pending_cache is None:
+            return
+        with torch.no_grad():
+            self.generator(
+                noisy_image_or_video=pending_cache["input"],
+                conditional_dict=conditional_dict,
+                timestep=pending_cache["timestep"],
+                kv_cache=self.kv_cache1,
+                crossattn_cache=self.crossattn_cache,
+                current_start=pending_cache["start"],
+            )
+
+    def _denoise_with_pending_cache(
+        self,
+        *,
+        noisy_input: torch.Tensor,
+        timestep: torch.Tensor,
+        start_token: int,
+        conditional_dict: dict,
+        pending_cache: Optional[dict],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Denoise while consuming the previous block's pending cache update.
+
+        Equal-sized adjacent blocks use the model's layer-fused mode. Other
+        geometries flush the pending cache first and retain exact behavior.
+        """
+        can_fuse = (
+            self.enable_denoise_cache_fusion
+            and pending_cache is not None
+            and pending_cache["input"].shape == noisy_input.shape
+            and pending_cache["start"] + noisy_input.shape[1] * self.frame_seq_length
+            == start_token
+        )
+        if can_fuse:
+            batch_size = noisy_input.shape[0]
+            fused_input = torch.cat(
+                [noisy_input, pending_cache["input"].detach()], dim=0
+            )
+            fused_timestep = torch.cat(
+                [timestep, pending_cache["timestep"].detach()], dim=0
+            )
+            current_starts = (
+                [start_token] * batch_size
+                + [pending_cache["start"]] * batch_size
+            )
+            flow_pred, denoised_pred = self.generator(
+                noisy_image_or_video=fused_input,
+                conditional_dict=self._duplicate_conditioning(conditional_dict),
+                timestep=fused_timestep,
+                kv_cache=self.kv_cache1,
+                crossattn_cache=(
+                    None if torch.is_grad_enabled() else self.crossattn_cache
+                ),
+                current_start=current_starts,
+                cache_write_idx=1,
+            )
+            return flow_pred[:batch_size], denoised_pred[:batch_size]
+
+        self._write_pending_cache(pending_cache, conditional_dict)
+        return self.generator(
+            noisy_image_or_video=noisy_input,
+            conditional_dict=conditional_dict,
+            timestep=timestep,
+            kv_cache=self.kv_cache1,
+            crossattn_cache=(
+                None if torch.is_grad_enabled() else self.crossattn_cache
+            ),
+            current_start=start_token,
+            cache_write_idx=-2,
+        )
 
     # ================================================================
     # Timestep-First Denoising Loop
@@ -334,94 +451,77 @@ class TimestepForcingTrainingPipeline:
         for step_index, current_timestep in enumerate(self.denoising_step_list):
             is_exit_step = (step_index == unified_exit_step)
             is_last_step = (step_index == num_denoising_steps - 1)
-            
+            pending_cache = None
+
             for block_index, (start_frame, current_num_frames) in enumerate(zip(block_start_frames, all_num_frames)):
                 noisy_input = noisy_inputs[block_index]
-                
+                start_token = start_frame * self.frame_seq_length
+                is_last_block = block_index == len(all_num_frames) - 1
+
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
 
                 need_gradient = is_exit_step and (start_frame >= start_gradient_frame_index)
-                
-                if not is_exit_step:
-                    # Non-exit step: do not compute gradients
+
+                if need_gradient:
+                    flow_pred, denoised_pred = self._denoise_with_pending_cache(
+                        noisy_input=noisy_input,
+                        timestep=timestep,
+                        start_token=start_token,
+                        conditional_dict=conditional_dict,
+                        pending_cache=pending_cache,
+                    )
+                else:
                     with torch.no_grad():
-                        flow_pred, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
+                        flow_pred, denoised_pred = self._denoise_with_pending_cache(
+                            noisy_input=noisy_input,
                             timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=start_frame * self.frame_seq_length
+                            start_token=start_token,
+                            conditional_dict=conditional_dict,
+                            pending_cache=pending_cache,
                         )
+                pending_cache = None
 
-                        next_timestep = self.denoising_step_list[step_index + 1]
-                        noisy_inputs[block_index] = self._compute_noisy_next(
-                            flow_pred, denoised_pred, noisy_input, timestep,
-                            next_timestep, batch_size, current_num_frames, noise.device)
+                if not is_exit_step:
+                    next_timestep = self.denoising_step_list[step_index + 1]
+                    noisy_inputs[block_index] = self._compute_noisy_next(
+                        flow_pred, denoised_pred, noisy_input, timestep,
+                        next_timestep, batch_size, current_num_frames, noise.device)
 
-                        # Update KV cache
+                    if not is_last_block:
                         if self.always_clean_context:
                             context_timestep = torch.ones_like(timestep) * self.context_noise
-                            cache_input_for_kv = denoised_pred
+                            cache_input = denoised_pred
                         else:
                             context_timestep = torch.ones_like(timestep) * next_timestep
-                            cache_input_for_kv = noisy_inputs[block_index]
-                        self.generator(
-                            noisy_image_or_video=cache_input_for_kv,
-                            conditional_dict=conditional_dict,
-                            timestep=context_timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=start_frame * self.frame_seq_length,
-                        )
+                            cache_input = noisy_inputs[block_index]
+                        pending_cache = {
+                            "input": cache_input.detach(),
+                            "timestep": context_timestep.detach(),
+                            "start": start_token,
+                        }
                 else:
-                    # Exit step: decide whether to compute gradients based on position
-                    if not need_gradient:
-                        with torch.no_grad():
-                            flow_pred, denoised_pred = self.generator(
-                                noisy_image_or_video=noisy_input,
-                                conditional_dict=conditional_dict,
-                                timestep=timestep,
-                                kv_cache=self.kv_cache1,
-                                crossattn_cache=self.crossattn_cache,
-                                current_start=start_frame * self.frame_seq_length
-                            )
-                    else:
-                        flow_pred, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
-                            timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=start_frame * self.frame_seq_length
-                        )
-
-                    # Record output
                     output[:, start_frame:start_frame + current_num_frames] = denoised_pred
+                    if not is_last_block:
+                        if is_last_step or self.always_clean_context:
+                            context_timestep = torch.ones_like(timestep) * self.context_noise
+                            cache_input = denoised_pred
+                        else:
+                            next_timestep = self.denoising_step_list[step_index + 1]
+                            cache_input = self._compute_noisy_next(
+                                flow_pred, denoised_pred, noisy_input, timestep,
+                                next_timestep, batch_size, current_num_frames, noise.device)
+                            context_timestep = torch.ones_like(timestep) * next_timestep
+                        pending_cache = {
+                            "input": cache_input.detach(),
+                            "timestep": context_timestep.detach(),
+                            "start": start_token,
+                        }
 
-                    # Update KV cache
-                    if is_last_step or self.always_clean_context:
-                        context_timestep = torch.ones_like(timestep) * self.context_noise
-                        cache_input = denoised_pred
-                    else:
-                        next_timestep = self.denoising_step_list[step_index + 1]
-                        cache_input = self._compute_noisy_next(
-                            flow_pred, denoised_pred, noisy_input, timestep,
-                            next_timestep, batch_size, current_num_frames, noise.device)
-                        context_timestep = torch.ones_like(timestep) * next_timestep
-                    
-                    with torch.no_grad():
-                        self.generator(
-                            noisy_image_or_video=cache_input,
-                            conditional_dict=conditional_dict,
-                            timestep=context_timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=start_frame * self.frame_seq_length,
-                        )
+            # The final block has no downstream cache consumer.
+            assert pending_cache is None
             
             if is_exit_step:
                 break
@@ -463,9 +563,16 @@ class TimestepForcingTrainingPipeline:
         Returns:
             unified_exit_step: Exit step index (takes exit_flags[0], used for subsequent timestep computation)
         """
+        pending_cache = None
         for block_index, (start_frame, current_num_frames) in enumerate(zip(block_start_frames, all_num_frames)):
             noisy_input = noisy_inputs[block_index]
-            block_exit_step = exit_flags[block_index]
+            block_exit_step = (
+                exit_flags[0]
+                if self.same_step_across_blocks
+                else exit_flags[block_index]
+            )
+            start_token = start_frame * self.frame_seq_length
+            is_last_block = block_index == len(all_num_frames) - 1
             
             # Used to store the exit step's flow_pred (may be needed for computing noisy context)
             exit_flow_pred = None
@@ -476,8 +583,6 @@ class TimestepForcingTrainingPipeline:
             # Inner loop: iterate over each denoising step
             for step_index, current_timestep in enumerate(self.denoising_step_list):
                 is_exit_step = (step_index == block_exit_step)
-                is_last_denoising_step = (step_index == num_denoising_steps - 1)
-                
                 timestep = torch.ones(
                     [batch_size, current_num_frames],
                     device=noise.device,
@@ -485,45 +590,33 @@ class TimestepForcingTrainingPipeline:
 
                 need_gradient = is_exit_step and (start_frame >= start_gradient_frame_index)
                 
-                if not is_exit_step:
-                    # Non-exit step: do not compute gradients, do not update KV cache
-                    with torch.no_grad():
-                        flow_pred, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
-                            timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=start_frame * self.frame_seq_length
-                        )
-
-                        # Compute the noisy input for the next step (do not update KV cache)
-                        next_timestep = self.denoising_step_list[step_index + 1]
-                        noisy_input = self._compute_noisy_next(
-                            flow_pred, denoised_pred, noisy_input, timestep,
-                            next_timestep, batch_size, current_num_frames, noise.device)
+                if need_gradient:
+                    flow_pred, denoised_pred = self._denoise_with_pending_cache(
+                        noisy_input=noisy_input,
+                        timestep=timestep,
+                        start_token=start_token,
+                        conditional_dict=conditional_dict,
+                        pending_cache=pending_cache,
+                    )
                 else:
-                    # Exit step: decide whether to compute gradients based on position
-                    if not need_gradient:
-                        with torch.no_grad():
-                            flow_pred, denoised_pred = self.generator(
-                                noisy_image_or_video=noisy_input,
-                                conditional_dict=conditional_dict,
-                                timestep=timestep,
-                                kv_cache=self.kv_cache1,
-                                crossattn_cache=self.crossattn_cache,
-                                current_start=start_frame * self.frame_seq_length
-                            )
-                    else:
-                        flow_pred, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
+                    with torch.no_grad():
+                        flow_pred, denoised_pred = self._denoise_with_pending_cache(
+                            noisy_input=noisy_input,
                             timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=start_frame * self.frame_seq_length
+                            start_token=start_token,
+                            conditional_dict=conditional_dict,
+                            pending_cache=pending_cache,
                         )
-                    
+                pending_cache = None
+
+                if not is_exit_step:
+                    # Compute the noisy input for the next step. Cache writes are
+                    # deliberately skipped for all inner-loop denoise passes.
+                    next_timestep = self.denoising_step_list[step_index + 1]
+                    noisy_input = self._compute_noisy_next(
+                        flow_pred, denoised_pred, noisy_input, timestep,
+                        next_timestep, batch_size, current_num_frames, noise.device)
+                else:
                     # Record the exit step's information for subsequent KV cache update
                     exit_flow_pred = flow_pred
                     exit_denoised_pred = denoised_pred
@@ -536,7 +629,7 @@ class TimestepForcingTrainingPipeline:
             
             # After block exits: update KV cache once
             # Logic is exactly the same as the exit step KV cache update in Timestep-First
-            if exit_denoised_pred is not None:
+            if exit_denoised_pred is not None and not is_last_block:
                 is_last_possible_step = (block_exit_step == num_denoising_steps - 1)
                 if is_last_possible_step or self.always_clean_context:
                     context_timestep = torch.ones_like(exit_timestep) * self.context_noise
@@ -548,28 +641,35 @@ class TimestepForcingTrainingPipeline:
                         next_timestep, batch_size, current_num_frames, noise.device)
                     context_timestep = torch.ones_like(exit_timestep) * next_timestep
                 
-                with torch.no_grad():
-                    self.generator(
-                        noisy_image_or_video=cache_input,
-                        conditional_dict=conditional_dict,
-                        timestep=context_timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=start_frame * self.frame_seq_length,
-                    )
+                pending_cache = {
+                    "input": cache_input.detach(),
+                    "timestep": context_timestep.detach(),
+                    "start": start_token,
+                }
+
+        # The final block has no downstream cache consumer.
+        assert pending_cache is None
         
         # Return exit_flags[0] for subsequent timestep computation (maintaining interface consistency)
         return exit_flags[0]
 
-    def _reset_kv_cache(self, device: torch.device):
-        """Reset KV cache."""
-        for block_index in range(self.num_transformer_blocks):
-            self.crossattn_cache[block_index]["is_init"] = False
-        for block_index in range(len(self.kv_cache1)):
-            self.kv_cache1[block_index]["global_end_index"] = torch.tensor(
-                [0], dtype=torch.long, device=device)
-            self.kv_cache1[block_index]["local_end_index"] = torch.tensor(
-                [0], dtype=torch.long, device=device)
+    def _reset_kv_cache(
+        self,
+        device: torch.device,
+        *,
+        reset_cross_attention: bool = False,
+    ):
+        """Reset cursors without clearing large cache tensors.
+
+        Cross-attention depends only on the prompt, so it is invalidated once at
+        the start of a rollout, not once per denoising timestep.
+        """
+        if reset_cross_attention:
+            for cache in self.crossattn_cache:
+                cache["is_init"] = False
+        for cache in self.kv_cache1:
+            cache["global_end_index"].zero_()
+            cache["local_end_index"].zero_()
 
     def _recache_initial_latent(
             self,
@@ -599,27 +699,70 @@ class TimestepForcingTrainingPipeline:
             )
 
     def _initialize_kv_cache(self, batch_size: int, dtype: torch.dtype, device: torch.device):
-        """Initialize KV cache for the Wan model."""
+        """Allocate or reuse the Wan self-attention cache."""
+        spec = (
+            batch_size,
+            self.kv_cache_size,
+            self.num_attention_heads,
+            self.attention_head_dim,
+            dtype,
+            torch.device(device),
+            self.num_transformer_blocks,
+        )
+        if self.kv_cache1 is not None and self._kv_cache_spec == spec:
+            return
+
         kv_cache1 = []
 
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, self.kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.empty(
+                    [batch_size, self.kv_cache_size, self.num_attention_heads, self.attention_head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
+                "v": torch.empty(
+                    [batch_size, self.kv_cache_size, self.num_attention_heads, self.attention_head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
 
         self.kv_cache1 = kv_cache1
+        self._kv_cache_spec = spec
 
     def _initialize_crossattn_cache(self, batch_size: int, dtype: torch.dtype, device: torch.device):
-        """Initialize cross-attention cache for the Wan model."""
+        """Allocate or reuse prompt K/V storage for cross-attention."""
+        spec = (
+            batch_size,
+            self.text_cache_length,
+            self.num_attention_heads,
+            self.attention_head_dim,
+            dtype,
+            torch.device(device),
+            self.num_transformer_blocks,
+        )
+        if self.crossattn_cache is not None and self._crossattn_cache_spec == spec:
+            return
+
         crossattn_cache = []
 
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "is_init": False
+                "k": torch.empty(
+                    [batch_size, self.text_cache_length, self.num_attention_heads, self.attention_head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
+                "v": torch.empty(
+                    [batch_size, self.text_cache_length, self.num_attention_heads, self.attention_head_dim],
+                    dtype=dtype,
+                    device=device,
+                ),
+                "is_init": False,
+                "batch_size": batch_size,
             })
         self.crossattn_cache = crossattn_cache
+        self._crossattn_cache_spec = spec

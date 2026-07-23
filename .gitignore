@@ -15,6 +15,7 @@ wan_models/
 # Outputs & logs
 outputs/
 logs/
+.test_artifacts/
 *.log
 
 # IDE & OS

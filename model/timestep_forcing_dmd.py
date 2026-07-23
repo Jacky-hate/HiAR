@@ -18,7 +18,24 @@ from typing import Tuple, Optional
 from pipeline import TimestepForcingTrainingPipeline
 from model.dmd import DMD
 from utils.wan_wrapper import WanDiffusionWrapper
-from utils.scheduler import FlowMatchScheduler
+
+
+def build_bidirectional_cd_sigmas(
+    num_timesteps: int, timestep_shift: float
+) -> torch.Tensor:
+    """FlowMatchScheduler(extra_one_step=True) training sigma grid."""
+    if num_timesteps < 2:
+        raise ValueError("num_timesteps must be at least 2")
+    if timestep_shift <= 0:
+        raise ValueError("timestep_shift must be positive")
+    base_sigmas = torch.linspace(
+        1.0, 0.0, num_timesteps + 1, dtype=torch.float32
+    )[:-1]
+    return (
+        timestep_shift
+        * base_sigmas
+        / (1.0 + (timestep_shift - 1.0) * base_sigmas)
+    )
 
 
 class TimestepForcingDMD(DMD):
@@ -32,6 +49,57 @@ class TimestepForcingDMD(DMD):
 
     def __init__(self, args, device):
         super().__init__(args, device)
+
+        # Online bidirectional consistency distillation replaces the old
+        # forward-KL trajectory-pair loss. The frozen 14B real_score supplies
+        # one PF-ODE step; student and EMA target use the same trainable causal
+        # backbone under a bidirectional full-sequence attention mask.
+        self.bidirectional_cd_enabled = bool(
+            getattr(args, "bidirectional_cd_enabled", False)
+        )
+        if self.bidirectional_cd_enabled:
+            if getattr(args, "pd_enabled", False):
+                raise ValueError(
+                    "bidirectional_cd_enabled and pd_enabled are mutually exclusive"
+                )
+            self.bidirectional_cd_num_timesteps = int(
+                getattr(args, "bidirectional_cd_num_timesteps", 48)
+            )
+            self.bidirectional_cd_timestep_shift = float(
+                getattr(args, "bidirectional_cd_timestep_shift", 5.0)
+            )
+            self.bidirectional_cd_guidance_scale = float(
+                getattr(args, "bidirectional_cd_guidance_scale", 3.0)
+            )
+            self.bidirectional_cd_sft_weight = float(
+                getattr(args, "bidirectional_cd_sft_weight", 0.0)
+            )
+            if self.bidirectional_cd_num_timesteps < 2:
+                raise ValueError(
+                    "bidirectional_cd_num_timesteps must be at least 2"
+                )
+            if self.bidirectional_cd_timestep_shift <= 0:
+                raise ValueError(
+                    "bidirectional_cd_timestep_shift must be positive"
+                )
+            if self.bidirectional_cd_sft_weight < 0:
+                raise ValueError(
+                    "bidirectional_cd_sft_weight must be non-negative"
+                )
+            # Reuse the adjacent-pair grid convention from Causal Forcing++:
+            # N nonzero training sigmas come from an N+1 endpoint grid, then
+            # randint(0, N-1) selects one of its N-1 adjacent training pairs.
+            # The objective here is Bi-CD, not the full Stage-2 method.
+            sigmas = build_bidirectional_cd_sigmas(
+                self.bidirectional_cd_num_timesteps,
+                self.bidirectional_cd_timestep_shift,
+            )
+            self.register_buffer(
+                "bidirectional_cd_sigmas", sigmas, persistent=True
+            )
+            self.bidirectional_cd_ema.model.num_frame_per_block = (
+                self.num_frame_per_block
+            )
         
         # ============================================================
         # Progressive Distillation configuration
@@ -48,7 +116,8 @@ class TimestepForcingDMD(DMD):
         assert self.pd_x0_target_mode in ('pred_x0', 'gt_x0'), \
             f"pd_x0_target_mode must be 'pred_x0' or 'gt_x0', got: {self.pd_x0_target_mode}"
         
-        # PD computation mode: single_forward (all frames in one forward pass) or rollout (block-by-block KV-cache inference)
+        # PD computation mode: single_forward is the paper's bidirectional
+        # Forward-KL path; rollout remains available for causal ablations.
         self.pd_compute_mode = getattr(args, 'pd_compute_mode', 'single_forward')
         assert self.pd_compute_mode in ('single_forward', 'rollout'), \
             f"pd_compute_mode must be 'single_forward' or 'rollout', got: {self.pd_compute_mode}"
@@ -57,57 +126,48 @@ class TimestepForcingDMD(DMD):
         self.pd_rollout_pipeline: Optional[TimestepForcingTrainingPipeline] = None
         
         if self.pd_enabled and self.pd_num_steps > 0:
-            # Precompute the (input_index, target_index) mapping in the teacher trajectory for each PD step
-            # The teacher ODE trajectory saves save_indices=[0,12,24,36,-1], a total of 5 points
-            # denoising_step_list=[1000,750,500,250], a total of 4 steps
-            # step 0: 1000->750 corresponds to teacher trajectory index 0->1 (x_T -> x_12)
-            # step 1: 750->500 corresponds to teacher trajectory index 1->2 (x_12 -> x_24)
-            # step 2: 500->250 corresponds to teacher trajectory index 2->3 (x_24 -> x_36)
-            # step 3: 250->0   corresponds to teacher trajectory index 3->4 (x_36 -> x_0)
-            num_denoising_steps = len(self.denoising_step_list)
-            assert self.pd_num_steps <= num_denoising_steps, \
-                f"pd_num_steps ({self.pd_num_steps}) cannot exceed the number of denoising steps ({num_denoising_steps})"
-            
-            # ============================================================
-            # Initialize the teacher's scheduler to obtain precise sigma values
-            # Teacher sampling uses shift=8.0, 48 steps; save_indices=[0,12,24,36,-1]
-            # These parameters must be consistent with generate_ode_pairs.py
-            # ============================================================
-            pd_teacher_timestep_shift = getattr(args, 'pd_teacher_timestep_shift', 8.0)
-            pd_teacher_num_inference_steps = getattr(args, 'pd_teacher_num_inference_steps', 48)
-            pd_teacher_save_indices = getattr(args, 'pd_teacher_save_indices', [0, 12, 24, 36, -1])
-            
-            teacher_scheduler = FlowMatchScheduler(
-                shift=pd_teacher_timestep_shift, sigma_min=0.0, extra_one_step=True
-            )
-            teacher_scheduler.set_timesteps(num_inference_steps=pd_teacher_num_inference_steps)
-            
-            # Precompute the teacher sigma corresponding to each save point
-            # sigma is the actual value encountered during teacher sampling
-            self.pd_teacher_sigmas = []
-            for si in pd_teacher_save_indices:
-                if si == -1:
-                    self.pd_teacher_sigmas.append(0.0)
-                else:
-                    self.pd_teacher_sigmas.append(teacher_scheduler.sigmas[si].item())
-            
-            # PD segment mapping: pd_step_index -> (teacher_input_idx, teacher_target_idx, input_timestep, target_timestep)
+            # Forward-KL pairs must be sampled at the student's exact sigma
+            # schedule. generate_ode_pairs.py interpolates the teacher ODE path
+            # at these values and records them in a required manifest.
+            model_timesteps = [
+                float(value) for value in self.denoising_step_list
+            ]
+            if not model_timesteps or model_timesteps[-1] != 0.0:
+                model_timesteps.append(0.0)
+            self.pd_aligned_sigmas = [
+                value / self.num_train_timestep for value in model_timesteps
+            ]
+            if any(
+                left <= right
+                for left, right in zip(
+                    self.pd_aligned_sigmas, self.pd_aligned_sigmas[1:]
+                )
+            ):
+                raise ValueError(
+                    "PD student sigmas must be strictly decreasing, got "
+                    f"{self.pd_aligned_sigmas}"
+                )
+            num_denoising_steps = len(self.pd_aligned_sigmas) - 1
+            if self.pd_num_steps > num_denoising_steps:
+                raise ValueError(
+                    f"pd_num_steps ({self.pd_num_steps}) cannot exceed the "
+                    f"number of denoising steps ({num_denoising_steps})"
+                )
+
             self.pd_segments = []
             for i in range(self.pd_num_steps):
-                input_timestep = self.denoising_step_list[i]
-                # target_timestep: the timestep of the next step; for the last step, the target is 0
-                if i + 1 < num_denoising_steps:
-                    target_timestep = self.denoising_step_list[i + 1]
-                else:
-                    target_timestep = torch.tensor(0, dtype=torch.long)
+                teacher_sigma_input = self.pd_aligned_sigmas[i]
+                teacher_sigma_target = self.pd_aligned_sigmas[i + 1]
+                input_timestep = teacher_sigma_input * self.num_train_timestep
+                target_timestep = teacher_sigma_target * self.num_train_timestep
                 self.pd_segments.append({
                     'teacher_input_idx': i,       # Input index in the teacher trajectory
                     'teacher_target_idx': i + 1,  # Target index in the teacher trajectory
                     'input_timestep': input_timestep,
                     'target_timestep': target_timestep,
                     # Precise sigma values of the teacher at these two save points
-                    'teacher_sigma_input': self.pd_teacher_sigmas[i],
-                    'teacher_sigma_target': self.pd_teacher_sigmas[i + 1],
+                    'teacher_sigma_input': teacher_sigma_input,
+                    'teacher_sigma_target': teacher_sigma_target,
                 })
 
     def _initialize_inference_pipeline(self):
@@ -135,7 +195,119 @@ class TimestepForcingDMD(DMD):
             always_clean_context=getattr(self.args, 'always_clean_context', False),
             min_exit_step=min_exit_step,
             denoising_order=getattr(self.args, 'denoising_order', 'timestep_first'),
+            enable_denoise_cache_fusion=getattr(
+                self.args, 'enable_denoise_cache_fusion', True
+            ),
         )
+
+    def bidirectional_consistency_loss(
+        self,
+        clean_latent: torch.Tensor,
+        conditional_dict: dict,
+        unconditional_dict: dict,
+    ) -> Tuple[torch.Tensor, dict]:
+        """Online adjacent-step bidirectional consistency loss on real data."""
+        if not self.bidirectional_cd_enabled:
+            return clean_latent.new_zeros(()), {}
+        if clean_latent.ndim != 5:
+            raise ValueError(
+                "clean_latent must have shape [B,F,C,H,W], got "
+                f"{tuple(clean_latent.shape)}"
+            )
+        if not torch.isfinite(clean_latent).all():
+            raise ValueError("clean_latent contains NaN or Inf")
+
+        pair_index = torch.randint(
+            0,
+            self.bidirectional_cd_num_timesteps - 1,
+            (1,),
+            device=clean_latent.device,
+        )
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(pair_index, src=0)
+        cd_sigmas = self.bidirectional_cd_sigmas.to(clean_latent.device)
+        sigma = cd_sigmas[pair_index]
+        sigma_next = cd_sigmas[pair_index + 1]
+        sigma_view = sigma.reshape(1, 1, 1, 1, 1)
+        sigma_next_view = sigma_next.reshape(1, 1, 1, 1, 1)
+        noise = torch.randn_like(clean_latent)
+        noisy = (
+            (1.0 - sigma_view) * clean_latent.float()
+            + sigma_view * noise.float()
+        ).to(self.dtype)
+        batch_size, num_frames = clean_latent.shape[:2]
+        timestep = (sigma * self.num_train_timestep).expand(
+            batch_size, num_frames
+        ).to(dtype=torch.float32)
+        next_timestep = (sigma_next * self.num_train_timestep).expand(
+            batch_size, num_frames
+        ).to(dtype=torch.float32)
+
+        with torch.no_grad():
+            teacher_flow_cond, _ = self.real_score(
+                noisy_image_or_video=noisy,
+                conditional_dict=conditional_dict,
+                timestep=timestep,
+                return_x0=False,
+            )
+            teacher_flow_uncond, _ = self.real_score(
+                noisy_image_or_video=noisy,
+                conditional_dict=unconditional_dict,
+                timestep=timestep,
+                return_x0=False,
+            )
+            # Standard CFG. Do not reuse DMD's cond+s*(cond-uncond), whose
+            # effective guidance scale is 1+s.
+            teacher_flow = teacher_flow_uncond + (
+                self.bidirectional_cd_guidance_scale
+                * (teacher_flow_cond - teacher_flow_uncond)
+            )
+            next_noisy = (
+                noisy.float()
+                + (sigma_next_view - sigma_view) * teacher_flow.float()
+            ).to(self.dtype)
+            ema_flow, _ = self.bidirectional_cd_ema(
+                noisy_image_or_video=next_noisy,
+                conditional_dict=conditional_dict,
+                timestep=next_timestep,
+                attention_mode="bidirectional",
+                return_x0=False,
+            )
+            target = (
+                next_noisy.float() - sigma_next_view * ema_flow.float()
+            )
+
+        student_flow, _ = self.generator(
+            noisy_image_or_video=noisy,
+            conditional_dict=conditional_dict,
+            timestep=timestep,
+            attention_mode="bidirectional",
+            return_x0=False,
+        )
+        prediction = noisy.float() - sigma_view * student_flow.float()
+        cd_loss = F.mse_loss(prediction, target.detach(), reduction="mean")
+        if self.bidirectional_cd_sft_weight > 0:
+            sft_loss = F.mse_loss(
+                prediction, clean_latent.float(), reduction="mean"
+            )
+        else:
+            sft_loss = cd_loss.new_zeros(())
+        total = (
+            cd_loss + self.bidirectional_cd_sft_weight * sft_loss
+        )
+        return total, {
+            "bidirectional_cd_loss_raw": cd_loss.detach(),
+            "bidirectional_cd_sft_loss": sft_loss.detach(),
+            "bidirectional_cd_pair_index": pair_index.detach().float(),
+            "bidirectional_cd_sigma": sigma.detach(),
+            "bidirectional_cd_sigma_next": sigma_next.detach(),
+            "bidirectional_cd_prediction_norm": (
+                prediction.square().mean().sqrt().detach()
+            ),
+            "bidirectional_cd_target_norm": (
+                target.square().mean().sqrt().detach()
+            ),
+        }
 
     # ================================================================
     # PD Rollout related methods
@@ -169,6 +341,9 @@ class TimestepForcingDMD(DMD):
             use_ode_trajectory=getattr(self.args, 'use_ode_trajectory', False),
             always_clean_context=getattr(self.args, 'always_clean_context', False),
             min_exit_step=0,                # Single-step pipeline, do not skip any step
+            enable_denoise_cache_fusion=getattr(
+                self.args, 'enable_denoise_cache_fusion', True
+            ),
         )
 
     def _pd_rollout(
@@ -265,7 +440,9 @@ class TimestepForcingDMD(DMD):
         teacher_input = ode_latent[:, segment['teacher_input_idx']]    # [B, F, C, H, W]
         teacher_target = ode_latent[:, segment['teacher_target_idx']]  # [B, F, C, H, W]
         
-        input_timestep = segment['input_timestep']
+        input_timestep = torch.as_tensor(
+            segment['input_timestep'], device=self.device, dtype=torch.float32
+        ).reshape(())
         target_timestep = segment['target_timestep']
         
         # Get student prediction based on computation mode
@@ -292,7 +469,7 @@ class TimestepForcingDMD(DMD):
         )
         
         log_dict.update({
-            'pd_loss': pd_loss.detach(),
+            'pd_loss_raw': pd_loss.detach(),
             'pd_step_idx': torch.tensor(pd_step_idx, device=self.device).float(),
             'pd_compute_mode': torch.tensor(
                 0.0 if self.pd_compute_mode == 'single_forward' else 1.0,
@@ -311,10 +488,10 @@ class TimestepForcingDMD(DMD):
         conditional_dict: dict,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        PD single_forward mode: All frames in one forward pass (blockwise causal attention).
+        PD single_forward mode: all frames in one bidirectional-attention pass.
 
-        This is the original computation method where all frames are computed in a single
-        forward pass through a blockwise causal mask.
+        Forward-KL must not modify the causal DMD rollout path. The same trainable
+        generator weights are evaluated with a full bidirectional mask here only.
 
         Args:
             teacher_input: [B, F, C, H, W]
@@ -327,14 +504,18 @@ class TimestepForcingDMD(DMD):
         """
         batch_size, num_frames = teacher_input.shape[:2]
         
-        timestep = torch.ones(
-            [batch_size, num_frames], device=self.device, dtype=torch.long
-        ) * input_timestep
+        timestep = torch.full(
+            [batch_size, num_frames],
+            float(input_timestep),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         flow_pred, x0_pred = self.generator(
             noisy_image_or_video=teacher_input.to(self.dtype),
             conditional_dict=conditional_dict,
-            timestep=timestep
+            timestep=timestep,
+            attention_mode="bidirectional",
         )
         
         return flow_pred, x0_pred
@@ -374,9 +555,12 @@ class TimestepForcingDMD(DMD):
         )
         
         # Derive flow_pred from x0_pred (used for velocity/euler_endpoint loss types)
-        timestep = torch.ones(
-            [batch_size, num_frames], device=self.device, dtype=torch.long
-        ) * input_timestep
+        timestep = torch.full(
+            [batch_size, num_frames],
+            float(input_timestep),
+            device=self.device,
+            dtype=torch.float32,
+        )
         
         flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
             scheduler=self.scheduler,
@@ -419,49 +603,29 @@ class TimestepForcingDMD(DMD):
         input_timestep = segment['input_timestep']
         target_timestep = segment['target_timestep']
         log_dict = {}
+        teacher_sigma_input = float(segment['teacher_sigma_input'])
+        teacher_sigma_target = float(segment['teacher_sigma_target'])
+        delta_sigma = teacher_sigma_target - teacher_sigma_input
+        if abs(delta_sigma) < 1.0e-12:
+            raise ValueError(
+                "PD teacher segment has zero sigma span: "
+                f"{teacher_sigma_input} -> {teacher_sigma_target}"
+            )
         
         if self.pd_loss_type == 'euler_endpoint':
-            # Euler step: x_next = x_t + flow_pred * (sigma_next - sigma_t)
-            timestep = torch.ones(
-                [batch_size, num_frames], device=self.device, dtype=torch.long
-            ) * input_timestep
-            
-            euler_result = self.scheduler.step(
-                flow_pred.flatten(0, 1),
-                timestep.flatten(0, 1),
-                teacher_input.to(self.dtype).flatten(0, 1),
-                target_timestep=target_timestep
-            ).unflatten(0, (batch_size, num_frames))
+            # Step over the teacher segment's real sigma interval. Using the
+            # student's nominal four-step interval is wrong when shifts differ.
+            euler_result = teacher_input.float() + flow_pred.float() * delta_sigma
             
             pd_loss = F.mse_loss(euler_result.float(), teacher_target.float())
             log_dict['pd_euler_loss'] = pd_loss.detach()
             
         elif self.pd_loss_type == 'velocity':
-            # Velocity regression: flow_pred ≈ (teacher_target - teacher_input) / (sigma_next - sigma_t)
-            timestep = torch.ones(
-                [batch_size, num_frames], device=self.device, dtype=torch.long
-            ) * input_timestep
-            
-            self.scheduler.sigmas = self.scheduler.sigmas.to(self.device)
-            self.scheduler.timesteps = self.scheduler.timesteps.to(self.device)
-            
-            t_flat = timestep.flatten(0, 1)
-            timestep_id = torch.argmin(
-                (self.scheduler.timesteps.unsqueeze(0) - t_flat.unsqueeze(1)).abs(), dim=1)
-            sigma_t = self.scheduler.sigmas[timestep_id].reshape(-1, 1, 1, 1)
-            
-            if not isinstance(target_timestep, torch.Tensor):
-                target_ts = torch.tensor([target_timestep], device=self.device)
-            else:
-                target_ts = target_timestep.to(self.device)
-            target_id = torch.argmin(
-                (self.scheduler.timesteps.unsqueeze(0) - target_ts.float().unsqueeze(1)).abs(), dim=1)
-            sigma_next = self.scheduler.sigmas[target_id].reshape(-1, 1, 1, 1)
-            
-            # v_target = (x_next - x_t) / (sigma_next - sigma_t)
-            delta_sigma = sigma_next - sigma_t
-            target_velocity = (teacher_target.flatten(0, 1).double() - teacher_input.flatten(0, 1).double()) / delta_sigma.double()
-            target_velocity = target_velocity.unflatten(0, (batch_size, num_frames)).float()
+            # Regress the chord velocity using the teacher's exact saved sigmas.
+            # This also avoids the old 0-D target_timestep.unsqueeze(1) crash.
+            target_velocity = (
+                (teacher_target.double() - teacher_input.double()) / delta_sigma
+            ).float()
             
             pd_loss = F.mse_loss(flow_pred.float(), target_velocity)
             log_dict['pd_velocity_loss'] = pd_loss.detach()
@@ -491,22 +655,22 @@ class TimestepForcingDMD(DMD):
                 # GT X0 mode: directly use teacher ODE final denoised output
                 assert gt_x0 is not None, \
                     "pd_x0_target_mode='gt_x0' requires gt_x0 (ode_latent[:, -1]) to be provided"
-                teacher_x0 = gt_x0.to(self.dtype)
+                teacher_x0 = gt_x0.float()
                 
                 pd_loss = F.mse_loss(x0_pred.float(), teacher_x0.float())
                 log_dict['pd_x0_loss'] = pd_loss.detach()
                 log_dict['pd_x0_target_mode'] = torch.tensor(1.0, device=self.device)  # 1.0 = gt_x0
             else:
                 # pred_x0 mode (default): linearly extrapolate from two save points
-                sigma_t = segment['teacher_sigma_input']
-                sigma_t_next = segment['teacher_sigma_target']
+                sigma_t = teacher_sigma_input
+                sigma_t_next = teacher_sigma_target
                 delta_sigma = sigma_t_next - sigma_t  # Negative (from noisy to clean)
                 
                 # Compute teacher's pred_x0 in double precision to avoid numerical errors
                 teacher_x0 = (
                     teacher_input.double() 
                     - sigma_t * (teacher_target.double() - teacher_input.double()) / delta_sigma
-                ).to(self.dtype)
+                ).float()
                 
                 pd_loss = F.mse_loss(x0_pred.float(), teacher_x0.float())
                 log_dict['pd_x0_loss'] = pd_loss.detach()

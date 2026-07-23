@@ -111,6 +111,43 @@ class WanVAEWrapper(torch.nn.Module):
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
+    def decode_last_frame(self, latent: torch.Tensor) -> torch.Tensor:
+        """Decode a causal latent prefix while retaining only its last frame.
+
+        Wan's decoder is causal and exposes persistent feature caches. Feeding
+        one latent timestep at a time is numerically equivalent to the regular
+        decode path, but avoids materializing an increasingly large pixel
+        video when long-rollout training only needs the boundary frame.
+        """
+        if latent.ndim != 5 or latent.shape[1] < 1:
+            raise ValueError(
+                f"latent must have shape [B,T,C,H,W] with T>0, got {latent.shape}"
+            )
+        zs = latent.permute(0, 2, 1, 3, 4)
+        device, dtype = latent.device, latent.dtype
+        scale = [
+            self.mean.to(device=device, dtype=dtype),
+            1.0 / self.std.to(device=device, dtype=dtype),
+        ]
+        last_frames = []
+        for sample in zs:
+            self.model.clear_cache()
+            try:
+                last = None
+                for frame_index in range(sample.shape[1]):
+                    decoded = self.model.cached_decode(
+                        sample[None, :, frame_index:frame_index + 1],
+                        scale,
+                    )
+                    last = decoded[:, :, -1:]
+                last_frames.append(
+                    last.float().clamp_(-1, 1).squeeze(0)
+                )
+            finally:
+                self.model.clear_cache()
+        output = torch.stack(last_frames, dim=0)
+        return output.permute(0, 2, 1, 3, 4)
+
 
 class WanDiffusionWrapper(torch.nn.Module):
     def __init__(
@@ -119,13 +156,32 @@ class WanDiffusionWrapper(torch.nn.Module):
             timestep_shift=8.0,
             is_causal=False,
             local_attn_size=-1,
-            sink_size=0
+            sink_size=0,
+            empty_init=False,
     ):
         super().__init__()
+        self.is_causal = is_causal
 
         if is_causal:
-            self.model = CausalWanModel.from_pretrained(
-                f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+            model_path = f"wan_models/{model_name}/"
+            if empty_init:
+                config = CausalWanModel.load_config(model_path)
+                with torch.device("meta"):
+                    self.model = CausalWanModel.from_config(
+                        config,
+                        local_attn_size=local_attn_size,
+                        sink_size=sink_size,
+                    )
+                # ``freqs`` is a plain tensor rather than a parameter/buffer,
+                # hence FSDP and state-dict loading cannot materialize it.
+                # Recompute it after leaving the meta-device context.
+                self.model.materialize_rope_freqs(device="cpu")
+            else:
+                self.model = CausalWanModel.from_pretrained(
+                    model_path,
+                    local_attn_size=local_attn_size,
+                    sink_size=sink_size,
+                )
         else:
             self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
         self.model.eval()
@@ -226,7 +282,9 @@ class WanDiffusionWrapper(torch.nn.Module):
         clean_x: Optional[torch.Tensor] = None,
         aug_t: Optional[torch.Tensor] = None,
         cache_start: Optional[int] = None,
-        cache_write_idx: int = -1
+        cache_write_idx: int = -1,
+        attention_mode: str = "causal",
+        return_x0: bool = True,
     ) -> torch.Tensor:
         prompt_embeds = conditional_dict["prompt_embeds"]
 
@@ -261,29 +319,43 @@ class WanDiffusionWrapper(torch.nn.Module):
                 ).permute(0, 2, 1, 3, 4)
             else:
                 if classify_mode:
-                    flow_pred, logits = self.model(
-                        noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
+                    model_kwargs = dict(
+                        t=input_timestep,
+                        context=prompt_embeds,
                         seq_len=self.seq_len,
                         classify_mode=True,
                         register_tokens=self._register_tokens,
                         cls_pred_branch=self._cls_pred_branch,
                         gan_ca_blocks=self._gan_ca_blocks,
-                        concat_time_embeddings=concat_time_embeddings
+                        concat_time_embeddings=concat_time_embeddings,
+                    )
+                    if self.is_causal:
+                        model_kwargs["attention_mode"] = attention_mode
+                    flow_pred, logits = self.model(
+                        noisy_image_or_video.permute(0, 2, 1, 3, 4),
+                        **model_kwargs,
                     )
                     flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
                 else:
+                    model_kwargs = dict(
+                        t=input_timestep,
+                        context=prompt_embeds,
+                        seq_len=self.seq_len,
+                    )
+                    if self.is_causal:
+                        model_kwargs["attention_mode"] = attention_mode
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),
-                        t=input_timestep, context=prompt_embeds,
-                        seq_len=self.seq_len
+                        **model_kwargs,
                     ).permute(0, 2, 1, 3, 4)
 
-        pred_x0 = self._convert_flow_pred_to_x0(
-            flow_pred=flow_pred.flatten(0, 1),
-            xt=noisy_image_or_video.flatten(0, 1),
-            timestep=timestep.flatten(0, 1)
-        ).unflatten(0, flow_pred.shape[:2])
+        pred_x0 = None
+        if return_x0:
+            pred_x0 = self._convert_flow_pred_to_x0(
+                flow_pred=flow_pred.flatten(0, 1),
+                xt=noisy_image_or_video.flatten(0, 1),
+                timestep=timestep.flatten(0, 1)
+            ).unflatten(0, flow_pred.shape[:2])
 
         if logits is not None:
             return flow_pred, pred_x0, logits

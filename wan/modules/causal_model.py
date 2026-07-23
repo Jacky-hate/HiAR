@@ -27,6 +27,19 @@ flex_attention = torch.compile(
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
+    if torch.is_tensor(start_frame):
+        start_frames = start_frame.detach().cpu().tolist()
+        if not isinstance(start_frames, list):
+            start_frames = [start_frames] * len(grid_sizes)
+    elif isinstance(start_frame, (list, tuple)):
+        start_frames = list(start_frame)
+    else:
+        start_frames = [start_frame] * len(grid_sizes)
+    if len(start_frames) != len(grid_sizes):
+        raise ValueError(
+            f"start_frame has {len(start_frames)} entries for batch {len(grid_sizes)}"
+        )
+
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
@@ -35,12 +48,13 @@ def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
 
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
         seq_len = f * h * w
+        sample_start_frame = int(start_frames[i])
 
         # precompute multipliers
         x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
-            freqs[0][start_frame:start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
+            freqs[0][sample_start_frame:sample_start_frame + f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
@@ -66,6 +80,10 @@ class CausalWanSelfAttention(nn.Module):
                  eps=1e-6):
         assert dim % num_heads == 0
         super().__init__()
+        if local_attn_size != -1 and local_attn_size <= 0:
+            raise ValueError("local_attn_size must be -1 or a positive frame count")
+        if sink_size < 0:
+            raise ValueError("sink_size must be non-negative")
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -82,6 +100,23 @@ class CausalWanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+    @staticmethod
+    def _cached_context_with_sink(cache, end_index, token_budget, sink_tokens):
+        """Select bounded cached history while retaining attention sinks."""
+
+        end_index = int(end_index)
+        token_budget = int(token_budget)
+        sink_tokens = min(int(sink_tokens), end_index, token_budget)
+        if token_budget <= 0 or end_index <= 0:
+            return cache[:, :0]
+        if end_index <= token_budget or sink_tokens <= 0:
+            return cache[:, max(0, end_index - token_budget):end_index]
+        tail_budget = token_budget - sink_tokens
+        tail_start = max(sink_tokens, end_index - tail_budget)
+        return torch.cat(
+            [cache[:, :sink_tokens], cache[:, tail_start:end_index]], dim=1
+        )
 
     def forward(
         self,
@@ -166,7 +201,7 @@ class CausalWanSelfAttention(nn.Module):
                     key=padded_roped_key.transpose(2, 1),
                     value=padded_v.transpose(2, 1),
                     block_mask=block_mask
-                )[:, :, :-padded_length].transpose(2, 1)
+                )[:, :, :q.shape[1]].transpose(2, 1)
 
             else:
                 roped_query = rope_apply(q, grid_sizes, freqs).type_as(v)
@@ -197,19 +232,40 @@ class CausalWanSelfAttention(nn.Module):
                     key=padded_roped_key.transpose(2, 1),
                     value=padded_v.transpose(2, 1),
                     block_mask=block_mask
-                )[:, :, :-padded_length].transpose(2, 1)
+                )[:, :, :q.shape[1]].transpose(2, 1)
         else:
             frame_seqlen = math.prod(grid_sizes[0][1:]).item()
-            current_start_frame = current_start // frame_seqlen
+            if torch.is_tensor(current_start):
+                current_values = current_start.detach().cpu().tolist()
+                if not isinstance(current_values, list):
+                    current_values = [current_values] * b
+                current_starts = [int(v) for v in current_values]
+            elif isinstance(current_start, (list, tuple)):
+                current_starts = [int(v) for v in current_start]
+            else:
+                current_starts = [int(current_start)] * b
+            if len(current_starts) != b:
+                raise ValueError(
+                    f"current_start has {len(current_starts)} entries for batch {b}"
+                )
+            current_start_frames = [v // frame_seqlen for v in current_starts]
             roped_query = causal_rope_apply(
-                q, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                q, grid_sizes, freqs, start_frame=current_start_frames).type_as(v)
             roped_key = causal_rope_apply(
-                k, grid_sizes, freqs, start_frame=current_start_frame).type_as(v)
+                k, grid_sizes, freqs, start_frame=current_start_frames).type_as(v)
 
-            current_end = current_start + roped_query.shape[1]
             sink_tokens = self.sink_size * frame_seqlen
             kv_cache_size = kv_cache["k"].shape[1]
             num_new_tokens = roped_query.shape[1]
+            if sink_tokens + num_new_tokens > min(
+                kv_cache_size, self.max_attention_size
+            ):
+                raise ValueError(
+                    "local attention cache cannot fit the configured sink and "
+                    f"current block: sink_tokens={sink_tokens}, "
+                    f"new_tokens={num_new_tokens}, cache_size={kv_cache_size}, "
+                    f"attention_size={self.max_attention_size}"
+                )
 
             skip_write = (cache_write_idx == -2)
 
@@ -218,20 +274,55 @@ class CausalWanSelfAttention(nn.Module):
                 # but do NOT update the cache. Used for denoise pass whose
                 # cache entries will be overwritten by the subsequent cache_update.
                 local_end_index = kv_cache["local_end_index"].item()
-                # Build full K/V: existing cache up to local_end + own new tokens
-                attn_start = max(0, local_end_index - (self.max_attention_size - num_new_tokens))
-                full_k = torch.cat([kv_cache["k"][:, attn_start:local_end_index], roped_key], dim=1)
-                full_v = torch.cat([kv_cache["v"][:, attn_start:local_end_index], v], dim=1)
+                history_budget = self.max_attention_size - num_new_tokens
+                full_k = torch.cat([
+                    self._cached_context_with_sink(
+                        kv_cache["k"], local_end_index, history_budget, sink_tokens
+                    ),
+                    roped_key,
+                ], dim=1)
+                full_v = torch.cat([
+                    self._cached_context_with_sink(
+                        kv_cache["v"], local_end_index, history_budget, sink_tokens
+                    ),
+                    v,
+                ], dim=1)
                 x = attention(roped_query, full_k, full_v)
                 # Do NOT update global_end_index / local_end_index
             elif cache_write_idx >= 0:
-                # ---- batched denoise + cache_update mode ----
-                # x is [2, L, ...], kv_cache is [1, cache_size, ...]
-                # Both halves share the same cache history for attention.
-                # Only half[cache_write_idx] persists its K/V into the cache.
+                # ---- layer-fused previous-cache + next-denoise mode ----
+                # The selected half writes the previous block. The other half
+                # denoises the immediately following block and attends to the
+                # freshly written cache at every transformer layer.
+                cache_batch = kv_cache["k"].shape[0]
+                if b != 2 * cache_batch or cache_write_idx not in (0, 1):
+                    raise ValueError(
+                        "fused cache mode requires input batch=2*cache batch and "
+                        "cache_write_idx selecting half 0 or 1"
+                    )
+                write_slice = slice(
+                    cache_write_idx * cache_batch,
+                    (cache_write_idx + 1) * cache_batch,
+                )
+                denoise_half = 1 - cache_write_idx
+                denoise_slice = slice(
+                    denoise_half * cache_batch,
+                    (denoise_half + 1) * cache_batch,
+                )
+                write_starts = current_starts[write_slice]
+                denoise_starts = current_starts[denoise_slice]
+                if len(set(write_starts)) != 1 or len(set(denoise_starts)) != 1:
+                    raise ValueError("all samples in a fused half must share current_start")
+                write_start = write_starts[0]
+                denoise_start = denoise_starts[0]
+                write_current_end = write_start + num_new_tokens
+                if denoise_start != write_current_end:
+                    raise ValueError(
+                        "fused denoise block must immediately follow the cache-update block"
+                    )
 
                 # Determine write position and handle eviction
-                if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
+                if self.local_attn_size != -1 and (write_current_end > kv_cache["global_end_index"].item()) and (
                         num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                     num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
                     num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - sink_tokens
@@ -239,31 +330,73 @@ class CausalWanSelfAttention(nn.Module):
                         kv_cache["k"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
                     kv_cache["v"][:, sink_tokens:sink_tokens + num_rolled_tokens] = \
                         kv_cache["v"][:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                    local_end_index = kv_cache["local_end_index"].item() + current_end - \
+                    local_end_index = kv_cache["local_end_index"].item() + write_current_end - \
                         kv_cache["global_end_index"].item() - num_evicted_tokens
                     local_start_index = local_end_index - num_new_tokens
                 else:
-                    local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+                    local_end_index = kv_cache["local_end_index"].item() + write_current_end - kv_cache["global_end_index"].item()
                     local_start_index = local_end_index - num_new_tokens
 
-                # Write only cache_write_idx's K/V into the cache
-                wk = roped_key[cache_write_idx:cache_write_idx + 1]
-                wv = v[cache_write_idx:cache_write_idx + 1]
+                # Write the selected batch half into its corresponding cache shards.
+                # Cache updates are truncated-context state, matching the
+                # standalone update executed under no_grad(). Do not introduce
+                # an unintended gradient path through the previous block.
+                wk = roped_key[write_slice].detach()
+                wv = v[write_slice].detach()
                 kv_cache["k"][:, local_start_index:local_end_index] = wk
                 kv_cache["v"][:, local_start_index:local_end_index] = wv
 
-                # Build full K/V for attention: cache_history + own new tokens
-                attn_start = max(0, local_end_index - self.max_attention_size)
-                cache_k = kv_cache["k"][:, attn_start:local_start_index].expand(b, -1, -1, -1)
-                cache_v = kv_cache["v"][:, attn_start:local_start_index].expand(b, -1, -1, -1)
-                full_k = torch.cat([cache_k, roped_key], dim=1)
-                full_v = torch.cat([cache_v, v], dim=1)
-                x = attention(roped_query, full_k, full_v)
+                # Cache-update queries see history before their own block. The
+                # denoise queries see the just-written previous block. Separate
+                # attention calls preserve this ordering while QKV/FFN remain batched.
+                history_budget = self.max_attention_size - num_new_tokens
+                write_k = torch.cat([
+                    self._cached_context_with_sink(
+                        kv_cache["k"], local_start_index,
+                        history_budget, sink_tokens,
+                    ),
+                    wk,
+                ], dim=1)
+                write_v = torch.cat([
+                    self._cached_context_with_sink(
+                        kv_cache["v"], local_start_index,
+                        history_budget, sink_tokens,
+                    ),
+                    wv,
+                ], dim=1)
+                write_x = attention(
+                    roped_query[write_slice], write_k, write_v
+                )
 
-                kv_cache["global_end_index"].fill_(current_end)
+                denoise_k = torch.cat([
+                    self._cached_context_with_sink(
+                        kv_cache["k"], local_end_index,
+                        history_budget, sink_tokens,
+                    ),
+                    roped_key[denoise_slice],
+                ], dim=1)
+                denoise_v = torch.cat([
+                    self._cached_context_with_sink(
+                        kv_cache["v"], local_end_index,
+                        history_budget, sink_tokens,
+                    ),
+                    v[denoise_slice],
+                ], dim=1)
+                denoise_x = attention(
+                    roped_query[denoise_slice], denoise_k, denoise_v
+                )
+                if cache_write_idx == 0:
+                    x = torch.cat([write_x, denoise_x], dim=0)
+                else:
+                    x = torch.cat([denoise_x, write_x], dim=0)
+
+                kv_cache["global_end_index"].fill_(write_current_end)
                 kv_cache["local_end_index"].fill_(local_end_index)
             else:
                 # ---- normal mode (cache_write_idx == -1) ----
+                current_end = current_starts[0] + roped_query.shape[1]
+                if any(start != current_starts[0] for start in current_starts):
+                    raise ValueError("normal cache mode requires one shared current_start")
                 if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (
                         num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
                     num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
@@ -284,8 +417,14 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["v"][:, local_start_index:local_end_index] = v
                 x = attention(
                     roped_query,
-                    kv_cache["k"][:, max(0, local_end_index - self.max_attention_size):local_end_index],
-                    kv_cache["v"][:, max(0, local_end_index - self.max_attention_size):local_end_index]
+                    self._cached_context_with_sink(
+                        kv_cache["k"], local_end_index,
+                        self.max_attention_size, sink_tokens,
+                    ),
+                    self._cached_context_with_sink(
+                        kv_cache["v"], local_end_index,
+                        self.max_attention_size, sink_tokens,
+                    ),
                 )
                 kv_cache["global_end_index"].fill_(current_end)
                 kv_cache["local_end_index"].fill_(local_end_index)
@@ -390,6 +529,16 @@ class CausalWanAttentionBlock(nn.Module):
             return x
 
         x = cross_attn_ffn(x, context, context_lens, e, crossattn_cache)
+        if cache_write_idx >= 0 and torch.is_grad_enabled():
+            cache_batch = kv_cache["k"].shape[0]
+            if cache_write_idx == 0:
+                x = torch.cat(
+                    [x[:cache_batch].detach(), x[cache_batch:]], dim=0
+                )
+            else:
+                x = torch.cat(
+                    [x[:cache_batch], x[cache_batch:].detach()], dim=0
+                )
         return x
 
 
@@ -534,15 +683,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # head
         self.head = CausalHead(dim, out_dim, patch_size, eps)
 
-        # buffers (don't use register_buffer otherwise dtype will be changed in to())
-        assert (dim % num_heads) == 0 and (dim // num_heads) % 2 == 0
-        d = dim // num_heads
-        self.freqs = torch.cat([
-            rope_params(1024, d - 4 * (d // 6)),
-            rope_params(1024, 2 * (d // 6)),
-            rope_params(1024, 2 * (d // 6))
-        ],
-            dim=1)
+        # Non-persistent RoPE frequencies.  Keep these out of the state dict so
+        # module dtype conversions do not cast the complex-valued table.
+        #
+        # This constructor is also used under a ``torch.device("meta")``
+        # context for the sharded Bi-CD target.  In that case ``self.freqs`` is
+        # deliberately meta here and must be rebuilt after leaving the context
+        # (see ``WanDiffusionWrapper(empty_init=True)``).
+        self.materialize_rope_freqs()
 
         if model_type == 'i2v':
             self.img_emb = MLPProj(1280, dim)
@@ -553,9 +701,38 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = False
 
         self.block_mask = None
+        self.block_mask_cache = {}
 
         self.num_frame_per_block = 1
         self.independent_first_frame = False
+
+    def materialize_rope_freqs(self, device=None):
+        """(Re)build the non-persistent RoPE table on a real device.
+
+        ``freqs`` is intentionally neither a parameter nor a registered buffer,
+        so FSDP's meta-parameter materialization and state-dict loading cannot
+        populate it.  Recomputing the deterministic table is both cheaper and
+        safer than checkpointing it.
+        """
+
+        assert (self.dim % self.num_heads) == 0 and (
+            self.dim // self.num_heads
+        ) % 2 == 0
+        d = self.dim // self.num_heads
+
+        def _build():
+            return torch.cat([
+                rope_params(1024, d - 4 * (d // 6)),
+                rope_params(1024, 2 * (d // 6)),
+                rope_params(1024, 2 * (d // 6))
+            ], dim=1)
+
+        if device is None:
+            self.freqs = _build()
+        else:
+            with torch.device(device):
+                self.freqs = _build()
+        return self.freqs
 
     def _set_gradient_checkpointing(self, module=None, value=False, enable=None, **kwargs):
         if enable is not None:
@@ -618,6 +795,97 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         # mask = cv2.resize(mask[0, 0].cpu().float().numpy(), (1024, 1024))
         # imageio.imwrite("mask_%d.jpg" % (0), np.uint8(255. * mask))
 
+        return block_mask
+
+    @staticmethod
+    def _prepare_bidirectional_attn_mask(
+        device: torch.device | str,
+        num_frames: int = 21,
+        frame_seqlen: int = 1560,
+    ) -> BlockMask:
+        """Create full attention over valid video tokens and isolate padding."""
+        total_length = num_frames * frame_seqlen
+        padded_length = math.ceil(total_length / 128) * 128 - total_length
+
+        def attention_mask(b, h, q_idx, kv_idx):
+            valid_attention = (q_idx < total_length) & (kv_idx < total_length)
+            padding_self_attention = q_idx == kv_idx
+            return valid_attention | padding_self_attention
+
+        return create_block_mask(
+            attention_mask,
+            B=None,
+            H=None,
+            Q_LEN=total_length + padded_length,
+            KV_LEN=total_length + padded_length,
+            _compile=False,
+            device=device,
+        )
+
+    def _get_training_block_mask(
+        self,
+        *,
+        device: torch.device | str,
+        num_frames: int,
+        frame_seqlen: int,
+        clean_x,
+        attention_mode: str,
+    ) -> BlockMask:
+        """Return a mask keyed by attention semantics and input geometry."""
+        if attention_mode not in ("causal", "bidirectional"):
+            raise ValueError(
+                f"attention_mode must be 'causal' or 'bidirectional', got {attention_mode!r}"
+            )
+        if clean_x is not None and attention_mode != "causal":
+            raise ValueError("teacher-forcing clean_x only supports causal attention")
+
+        cache_key = (
+            attention_mode,
+            clean_x is not None,
+            self.independent_first_frame,
+            num_frames,
+            frame_seqlen,
+            self.num_frame_per_block,
+            self.local_attn_size,
+            str(device),
+        )
+        block_mask = self.block_mask_cache.get(cache_key)
+        if block_mask is not None:
+            return block_mask
+
+        if clean_x is not None:
+            if self.independent_first_frame:
+                raise NotImplementedError()
+            block_mask = self._prepare_teacher_forcing_mask(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+            )
+        elif attention_mode == "bidirectional":
+            block_mask = self._prepare_bidirectional_attn_mask(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+            )
+        elif self.independent_first_frame:
+            block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size,
+            )
+        else:
+            block_mask = self._prepare_blockwise_causal_attn_mask(
+                device,
+                num_frames=num_frames,
+                frame_seqlen=frame_seqlen,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size,
+            )
+
+        self.block_mask_cache[cache_key] = block_mask
         return block_mask
 
     @staticmethod
@@ -848,37 +1116,76 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             block_mask=self.block_mask
         )
 
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
-
         for block_index, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and self.gradient_checkpointing:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start,
-                        "cache_write_idx": cache_write_idx
+            layer_cache = kv_cache[block_index]
+            layer_cross_cache = (
+                crossattn_cache[block_index]
+                if crossattn_cache is not None else None
+            )
+            block_kwargs = {
+                **kwargs,
+                "crossattn_cache": layer_cross_cache,
+                "current_start": current_start,
+                "cache_start": cache_start,
+                "cache_write_idx": cache_write_idx,
+            }
+
+            # Cached checkpoint replay needs the cursor values from the original
+            # call, not the later rollout state. K/V storage itself is safe to
+            # share for the default non-evicting training cache: later blocks
+            # only append/overwrite later slots, and fused writes are detached.
+            checkpoint_cached_block = (
+                torch.is_grad_enabled()
+                and self.gradient_checkpointing
+                and layer_cross_cache is None
+                and block.self_attn.local_attn_size == -1
+                and cache_write_idx in (-2, 0, 1)
+            )
+            if checkpoint_cached_block:
+                initial_global_end = layer_cache["global_end_index"].clone()
+                initial_local_end = layer_cache["local_end_index"].clone()
+                forward_end_state = {}
+
+                def checkpointed_forward(
+                    hidden_states,
+                    _block=block,
+                    _layer_cache=layer_cache,
+                    _initial_global_end=initial_global_end,
+                    _initial_local_end=initial_local_end,
+                    _forward_end_state=forward_end_state,
+                    **replay_kwargs,
+                ):
+                    replay_cache = {
+                        "k": _layer_cache["k"],
+                        "v": _layer_cache["v"],
+                        "global_end_index": _initial_global_end.clone(),
+                        "local_end_index": _initial_local_end.clone(),
                     }
-                )
+                    result = _block(
+                        hidden_states, kv_cache=replay_cache, **replay_kwargs
+                    )
+                    _forward_end_state["global"] = replay_cache[
+                        "global_end_index"
+                    ].clone()
+                    _forward_end_state["local"] = replay_cache[
+                        "local_end_index"
+                    ].clone()
+                    return result
+
                 x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
+                    checkpointed_forward,
+                    x,
+                    **block_kwargs,
                     use_reentrant=False,
                 )
-            else:
-                kwargs.update(
-                    {
-                        "kv_cache": kv_cache[block_index],
-                        "crossattn_cache": crossattn_cache[block_index],
-                        "current_start": current_start,
-                        "cache_start": cache_start,
-                        "cache_write_idx": cache_write_idx
-                    }
+                layer_cache["global_end_index"].copy_(
+                    forward_end_state["global"]
                 )
-                x = block(x, **kwargs)
+                layer_cache["local_end_index"].copy_(
+                    forward_end_state["local"]
+                )
+            else:
+                x = block(x, kv_cache=layer_cache, **block_kwargs)
 
         # head
         x = self.head(x, e.unflatten(dim=0, sizes=t.shape).unsqueeze(2))
@@ -896,6 +1203,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         aug_t=None,
         clip_fea=None,
         y=None,
+        attention_mode="causal",
     ):
         r"""
         Forward pass through the diffusion model
@@ -925,32 +1233,17 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        # Construct blockwise causal attn mask
-        if self.block_mask is None:
-            if clean_x is not None:
-                if self.independent_first_frame:
-                    raise NotImplementedError()
-                else:
-                    self.block_mask = self._prepare_teacher_forcing_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block
-                    )
-            else:
-                if self.independent_first_frame:
-                    self.block_mask = self._prepare_blockwise_causal_attn_mask_i2v(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
-                    )
-                else:
-                    self.block_mask = self._prepare_blockwise_causal_attn_mask(
-                        device, num_frames=x.shape[2],
-                        frame_seqlen=x.shape[-2] * x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-                        num_frame_per_block=self.num_frame_per_block,
-                        local_attn_size=self.local_attn_size
-                    )
+        frame_seqlen = (
+            x.shape[-2] * x.shape[-1]
+            // (self.patch_size[1] * self.patch_size[2])
+        )
+        block_mask = self._get_training_block_mask(
+            device=device,
+            num_frames=x.shape[2],
+            frame_seqlen=frame_seqlen,
+            clean_x=clean_x,
+            attention_mode=attention_mode,
+        )
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
@@ -1017,7 +1310,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             freqs=self.freqs,
             context=context,
             context_lens=context_lens,
-            block_mask=self.block_mask)
+            block_mask=block_mask)
 
         def create_custom_forward(module):
             def custom_forward(*inputs, **kwargs):

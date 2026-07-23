@@ -25,10 +25,12 @@ num_train_timestep: 1000
 timestep_shift: 5.0
 guidance_scale: 3.0
 denoising_loss_type: flow
+dmd_normalizer_eps: 1.0e-6
 
 # Mixed precision
 mixed_precision: true
-seed: 0
+# Fixed so data windows and sampler order remain reproducible after resume.
+seed: 42
 
 # WandB (optional, set via environment or override here)
 wandb_host: WANDB_HOST
@@ -47,13 +49,35 @@ beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
 
-# Data
-data_path: data/vidprom_filtered_extended.txt
+# Real-video data. Override this path and any private source filters locally.
+data_path: data/train.sqlite
+data_exclude_metadata_patterns: []
 batch_size: 1
+data_num_workers: 2
+data_prefetch_factor: 1
+# The critic loader returns prompt strings only. Keep it in-process to avoid
+# late-forking after CUDA/NCCL/torch.compile initialization.
+critic_data_num_workers: 0
+data_pin_memory: true
+data_prompt_cache_size: 128
+# Each SQLite record can contain many captioned clips. Sample a temporal
+# window wholly inside one frame-indexed prompt segment instead of crossing
+# two adjacent captions.
+data_align_prompt_segments: true
+# 0 preserves the source's consecutive frame indices.
+data_target_fps: 0
 ema_weight: 0.99
 ema_start_step: 200
-total_batch_size: 64
-log_iters: 100
+total_batch_size: 32
+max_steps: 10000
+# Logging, checkpointing and evaluation are intentionally independent.
+log_interval: 1
+checkpoint_interval: 100
+max_checkpoints_to_keep: 5
+eval_interval: 100
+eval_num_prompts: 1
+eval_num_frames: 21
+ema_device: cpu
 
 # Negative prompt (Chinese, for Wan model CFG)
 negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
@@ -76,7 +100,7 @@ trainer: score_distillation
 # Model
 gradient_checkpointing: true
 num_frame_per_block: 3
-load_raw_video: false
+load_raw_video: true
 model_kwargs:
   timestep_shift: 5.0
 
@@ -87,38 +111,28 @@ last_step_only: false
 # Number of frames for gradient computation
 num_training_frames: 21
 # Extended rollout length (gradients only on last num_training_frames frames)
-num_rollout_frames: 21
+num_rollout_frames: 24
 # Use stochastic (SDE) trajectory for stepping
 use_ode_trajectory: false
 # Use noisy context at intermediate steps (core to hierarchical denoising)
 always_clean_context: false
+# Fuse the previous block's cache update with the next block's denoise pass.
+enable_denoise_cache_fusion: true
 
-# ---- Forward-KL Regularization ----
-# Prevents low-motion shortcuts in DMD training.
-# Applied to the first pd_num_steps denoising steps in bidirectional attention mode.
-pd_enabled: true
-# Number of steps for forward-KL (from step 0)
-pd_num_steps: 1
-# Forward-KL loss weight
-pd_loss_weight: 0.1
-# Path to pre-generated ODE trajectory pairs
-pd_data_path: data/ode_pairs
-# Loss type: "x0" (x0 prediction regression)
-pd_loss_type: x0
-# Target mode: "pred_x0" (extrapolated from teacher save points)
-pd_x0_target_mode: pred_x0
-# Compute mode: "single_forward" (full-sequence blockwise causal attention)
-pd_compute_mode: single_forward
-
-# ---- Teacher ODE Trajectory Settings ----
-# Must match the parameters used in scripts/generate_ode_pairs.py
-pd_teacher_timestep_shift: 8.0
-pd_teacher_num_inference_steps: 48
-pd_teacher_save_indices:
-- 0
-- 12
-- 24
-- 36
-- -1
+# ---- Online bidirectional consistency distillation ----
+# Replaces forward-KL/PD trajectory pairs. The frozen 14B real_score takes one
+# adjacent PF-ODE step online from a real clean video latent. Student and its
+# sharded EMA target are evaluated with full bidirectional attention only for
+# this auxiliary loss; the main DMD rollout remains causal/noisy-prefix.
+pd_enabled: false
+bidirectional_cd_enabled: true
+bidirectional_cd_loss_weight: 0.03
+bidirectional_cd_num_timesteps: 48
+bidirectional_cd_timestep_shift: 5.0
+bidirectional_cd_guidance_scale: 3.0
+bidirectional_cd_ema_decay: 0.99
+bidirectional_cd_sft_weight: 0.0
+# Avoid retaining full unsharded gradients across accumulation microbatches.
+sync_each_microbatch: true
 
 min_exit_step: 0
